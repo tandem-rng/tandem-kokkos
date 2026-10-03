@@ -1,5 +1,5 @@
 /* Tandem8x32 for Kokkos: fills of rank-1 Views on any execution space, and the scalar
- * generator tandem::Rng from core.hpp for draws inside kernels.
+ * generator tandem::Rng from tandem/core.hpp for draws inside kernels.
  *
  * Implements https://github.com/tandem-rng/spec and produces the stream it defines, bit for
  * bit. Copyright 2026 Jessica Cox. Apache License 2.0, see LICENSE.
@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include "core.hpp"
+#include <tandem/core.hpp>
 
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
 #error "tandem/kokkos.hpp assumes a little-endian host"

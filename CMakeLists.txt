@@ -12,13 +12,15 @@ add_library(tandem_kokkos INTERFACE)
 add_library(tandem::kokkos ALIAS tandem_kokkos)
 target_include_directories(tandem_kokkos INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/tandem-cuda/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(tandem_kokkos INTERFACE Kokkos::kokkos)
 target_compile_features(tandem_kokkos INTERFACE cxx_std_17)
 set_target_properties(tandem_kokkos PROPERTIES EXPORT_NAME kokkos)
 
 include(CMakePackageConfigHelpers)
-install(DIRECTORY include/tandem DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY include/tandem external/tandem-cuda/include/tandem
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS tandem_kokkos EXPORT tandem-kokkos-targets)
 install(EXPORT tandem-kokkos-targets NAMESPACE tandem::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tandem-kokkos)
