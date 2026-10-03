@@ -1,0 +1,45 @@
+# Development environments. The default one takes Kokkos 5.2.1 (Serial and OpenMP) from
+# conda-forge. The `cuda` one has a CUDA 12.8 toolchain and builds Kokkos with the CUDA
+# backend from source, because the conda-forge package has none.
+[workspace]
+name = "tandem-kokkos"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+cmake = ">=3.25"
+ninja = "*"
+python = ">=3.11"
+
+[feature.host.dependencies]
+kokkos = "5.2.1.*"
+cxx-compiler = "*"
+
+[feature.host.target.osx-arm64.dependencies]
+llvm-openmp = "*"
+
+[feature.host.tasks]
+configure = "cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DTANDEM_BENCH=ON"
+build = { cmd = "cmake --build build/host", depends-on = ["configure"] }
+test = { cmd = "ctest --test-dir build/host --output-on-failure", depends-on = ["build"] }
+
+[feature.cuda]
+platforms = ["linux-64"]
+
+[feature.cuda.dependencies]
+cuda-version = "12.8.*"
+cuda-nvcc = "12.8.*"
+cuda-cudart-dev = "12.8.*"
+gxx = "13.*"
+gcc = "13.*"
+git = "*"
+
+[feature.cuda.tasks]
+kokkos = "bash tools/build_kokkos_cuda.sh"
+configure-cuda = "NVCC_WRAPPER_DEFAULT_COMPILER=$CXX cmake -S . -B build/cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DTANDEM_BENCH=ON -DKokkos_ROOT=build/kokkos-cuda/install -DCMAKE_CXX_COMPILER=$PIXI_PROJECT_ROOT/build/kokkos-cuda/install/bin/nvcc_wrapper"
+build-cuda = { cmd = "NVCC_WRAPPER_DEFAULT_COMPILER=$CXX cmake --build build/cuda", depends-on = ["configure-cuda"] }
+test-cuda = { cmd = "ctest --test-dir build/cuda --output-on-failure", depends-on = ["build-cuda"] }
+
+[environments]
+default = ["host"]
+cuda = { features = ["cuda"] }
