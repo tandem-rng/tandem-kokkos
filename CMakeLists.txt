@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
 project(tandem_kokkos VERSION 0.1.0 LANGUAGES CXX)
 
-find_package(Kokkos REQUIRED)
+# A parent project may build Kokkos in-tree, which defines the target without a package.
+if(NOT TARGET Kokkos::kokkos)
+    find_package(Kokkos REQUIRED)
+endif()
+
+include(GNUInstallDirs)
 
 add_library(tandem_kokkos INTERFACE)
 add_library(tandem::kokkos ALIAS tandem_kokkos)
@@ -12,7 +17,6 @@ target_link_libraries(tandem_kokkos INTERFACE Kokkos::kokkos)
 target_compile_features(tandem_kokkos INTERFACE cxx_std_17)
 set_target_properties(tandem_kokkos PROPERTIES EXPORT_NAME kokkos)
 
-include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 install(DIRECTORY include/tandem DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS tandem_kokkos EXPORT tandem-kokkos-targets)
