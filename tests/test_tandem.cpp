@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include <Kokkos_Random.hpp>
 #include <tandem/kokkos.hpp>
 
 #include "vectors.hpp"
@@ -430,6 +431,19 @@ template <class Exec> static void test_bounded() {
     // Mean and second moment of a standard normal, within five standard errors.
     CHECK(std::abs(hm(0)) < 5 / std::sqrt((double)n));
     CHECK(std::abs(hm(1) - 1) < 5 * std::sqrt(2.0 / n));
+
+    // Kokkos::rand<Generator, T> drives Rng through the method names of the Kokkos generators.
+    using KR = Kokkos::rand<Rng, double>;
+    using KF = Kokkos::rand<Rng, float>;
+    using KU = Kokkos::rand<Rng, uint32_t>;
+    using KI = Kokkos::rand<Rng, int64_t>;
+    using KU64 = Kokkos::rand<Rng, uint64_t>;
+    Rng a = Rng::from_key(key, 0, 32), b = a;
+    CHECK(KR::draw(a) == b.drand());
+    CHECK(KF::draw(a, 2.0f) == b.frand(2.0f));
+    CHECK(KU::draw(a, 10u) == b.urand(10u));
+    CHECK(KI::draw(a, -4, 9) == b.rand64(-4, 9));
+    CHECK(KU64::draw(a) == b.urand64());
 }
 
 // ---- Backends -----------------------------------------------------------------------------
