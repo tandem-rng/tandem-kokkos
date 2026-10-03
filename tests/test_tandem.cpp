@@ -1,0 +1,493 @@
+// Spec vectors, reference stream dumps, fills against in-kernel draws, split fills, derived
+// keys, bounded draws, and byte identity across backends, on every enabled execution space.
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+#include <tandem/kokkos.hpp>
+
+#include "vectors.hpp"
+
+using tandem::Key;
+using tandem::Rng;
+using tandem::detail::Kernel;
+
+static long checks, failures;
+
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        checks++;                                                                                  \
+        if (!(cond)) {                                                                             \
+            failures++;                                                                            \
+            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                            \
+        }                                                                                          \
+    } while (0)
+
+static Key key_of(const uint32_t w[4]) { return Key{{w[0], w[1], w[2], w[3]}}; }
+static bool words_equal(const uint32_t a[4], const uint32_t b[4]) {
+    return std::memcmp(a, b, 16) == 0;
+}
+
+template <class E> constexpr unsigned bits_of = tandem::detail::elem<E>::bits;
+
+// Host copies and dumps hold bools as bytes, because std::vector<bool> has no data().
+template <class E> using host_t = std::conditional_t<std::is_same_v<E, bool>, uint8_t, E>;
+
+template <class E> KOKKOS_INLINE_FUNCTION E draw(Rng &r) {
+    if constexpr (std::is_same_v<E, bool>)
+        return r.bit();
+    else if constexpr (std::is_same_v<E, uint32_t>)
+        return r.urand();
+    else if constexpr (std::is_same_v<E, uint64_t>)
+        return r.urand64();
+    else if constexpr (std::is_same_v<E, float>)
+        return r.frand();
+    else
+        return r.drand();
+}
+
+template <class Exec> static std::vector<Kernel> kernels() {
+    if (Kokkos::SpaceAccessibility<Kokkos::HostSpace, typename Exec::memory_space>::accessible)
+        return {Kernel::Group, Kernel::Chunk};
+    return {Kernel::Tile, Kernel::Chunk};
+}
+
+static const char *name(Kernel k) {
+    return k == Kernel::Group ? "group" : k == Kernel::Tile ? "tile" : "chunk";
+}
+
+// Host copy of a fill of n elements from (key, pos, K) on Exec, `shift` elements into the
+// allocation so that the output's alignment varies.
+template <class Exec, class E>
+static std::vector<host_t<E>> device_fill(const Key &key, uint64_t pos, uint32_t K, size_t n,
+                                          Kernel kernel, size_t shift = 0,
+                                          uint64_t *end = nullptr) {
+    Kokkos::View<E *, typename Exec::memory_space> buf("fill", n + 4);
+    auto out = Kokkos::subview(buf, Kokkos::pair<size_t, size_t>(shift, shift + n));
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill(Exec(), out, r, kernel);
+    Exec().fence();
+    if (end)
+        *end = r.position();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    return std::vector<host_t<E>>(host.data(), host.data() + n);
+}
+
+// Host copy of n scalar draws on Exec, 256 consecutive draws per work item, each work item
+// with its own generator placed at its first element.
+template <class Exec, class E>
+static std::vector<host_t<E>> device_draws(const Key &key, uint64_t pos, uint32_t K, size_t n) {
+    Kokkos::View<E *, typename Exec::memory_space> v("draws", n);
+    constexpr int64_t per = 256;
+    uint64_t p0 = tandem::align_pos(pos, bits_of<E>);
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Exec>(0, (int64_t)((n + per - 1) / per)), KOKKOS_LAMBDA(int64_t i) {
+            Rng r = Rng::from_key(key, p0 + (uint64_t)i * per * bits_of<E>, K);
+            for (int64_t k = i * per; k < (i + 1) * per && k < (int64_t)v.extent(0); k++)
+                v(k) = draw<E>(r);
+        });
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
+    return std::vector<host_t<E>>(host.data(), host.data() + n);
+}
+
+template <class A, class B> static size_t first_diff(const A &a, const B &b) {
+    size_t i = 0;
+    while (i < a.size() && i < b.size() && a[i] == (typename A::value_type)b[i])
+        i++;
+    return a.size() == b.size() && i == a.size() ? SIZE_MAX : i;
+}
+
+// w bits (1 to 64) at the w-aligned stream position q, read from u32 words that start at the
+// 32-aligned position base.
+static uint64_t bits_at(const std::vector<uint32_t> &words, uint64_t base, uint64_t q, unsigned w) {
+    size_t i = (size_t)((q - base) >> 5);
+    if (w == 64)
+        return words[i] | ((uint64_t)words[i + 1] << 32);
+    return (words[i] >> (q & 31u)) & (0xffffffffu >> (32u - w));
+}
+
+// ---- Vectors ------------------------------------------------------------------------------
+
+template <class Exec> static void test_vectors() {
+    for (const auto &v : VEC_T) {
+        uint32_t o[4], h[4];
+        std::memcpy(o, v.o, 16);
+        std::memcpy(h, v.h, 16);
+        tandem::T(o, h);
+        CHECK(words_equal(o, v.o_out) && words_equal(h, v.h_out));
+    }
+    for (const auto &v : VEC_F) {
+        uint32_t o[4], h[4];
+        tandem::F_keyed(VEC_KEY, v.counter, tandem::DOMAIN_STREAM, tandem::AUX_STREAM, o, h);
+        CHECK(words_equal(o, v.o) && words_equal(h, v.h));
+    }
+    const Key key = key_of(VEC_KEY);
+    for (Kernel kernel : kernels<Exec>()) {
+        auto u32 = device_fill<Exec, uint32_t>(key, 0, VEC_K, 64, kernel);
+        for (const auto &s : VEC_STREAM) {
+            CHECK(std::memcmp(&u32[s.first_word], s.words, 16) == 0);
+            uint64_t p = s.first_word * 32;
+            uint32_t b[4];
+            tandem::block(VEC_KEY, tandem::chunk_of(p, VEC_K), tandem::step_of(p, VEC_K), b);
+            CHECK(words_equal(b, s.words));
+        }
+        auto f64 = device_fill<Exec, double>(key, 0, VEC_K, 32, kernel);
+        for (const auto &v : VEC_F64)
+            CHECK(f64[v.index] == v.value);
+        auto f32 = device_fill<Exec, float>(key, 0, VEC_K, 32, kernel);
+        for (const auto &v : VEC_F32)
+            CHECK(f32[v.index] == v.value);
+        auto bits = device_fill<Exec, bool>(key, 0, VEC_K, 129, kernel);
+        for (const auto &v : VEC_BOOL)
+            CHECK(bits[v.index] == (v.value != 0));
+    }
+
+    // Derived keys, computed in a kernel.
+    Kokkos::View<uint32_t *[4], typename Exec::memory_space> k("keys", 6);
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Exec>(0, 1), KOKKOS_LAMBDA(int) {
+            Rng r = Rng::from_key(key, 0, VEC_K);
+            Rng kids[2];
+            Rng f = r;
+            f.fork(kids, 2);
+            const Key ks[6] = {r.split(0).key(), r.split(1).key(), r.sub(7).key(),
+                               kids[0].key(),    kids[1].key(),    Rng(VEC_SEED, 0, VEC_K).key()};
+            for (int i = 0; i < 6; i++)
+                for (int w = 0; w < 4; w++)
+                    k(i, w) = ks[i].w[w];
+        });
+    auto hk = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k);
+    uint32_t got[6][4];
+    for (int i = 0; i < 6; i++)
+        for (int w = 0; w < 4; w++)
+            got[i][w] = hk(i, w);
+    CHECK(words_equal(got[0], VEC_SPLIT0));
+    CHECK(words_equal(got[1], VEC_SPLIT1));
+    CHECK(words_equal(got[2], VEC_PURPOSE7));
+    CHECK(words_equal(got[3], VEC_FORK0));
+    CHECK(words_equal(got[5], VEC_SEED_KEY));
+    // Fork child 1 is the hidden half of the same F as child 0.
+    uint32_t o[4], h[4];
+    tandem::F_keyed(VEC_KEY, 0, tandem::DOMAIN_FORK, 0, o, h);
+    CHECK(words_equal(got[4], h));
+
+    // A fork advances the parent past the current block, from a block boundary to the next.
+    Rng r = Rng::from_key(key, 128, VEC_K), kid;
+    r.fork(&kid, 1);
+    CHECK(r.position() == 256);
+    r.fork(&kid, 0);
+    CHECK(r.position() == 384);
+    // split and sub keep the parent position and give children position 0 at the parent's K.
+    Rng s = Rng::from_key(key, 77, 8).split(3);
+    CHECK(s.position() == 0 && s.chunk_length() == 8);
+
+    const Key seed_key = Rng(VEC_SEED, 0, VEC_K).key();
+    auto sf64 = device_fill<Exec, double>(seed_key, 0, VEC_K, 32, kernels<Exec>()[0]);
+    for (const auto &v : VEC_SEED_F64)
+        CHECK(sf64[v.index] == v.value);
+    auto su32 = device_fill<Exec, uint32_t>(seed_key, 0, VEC_K, 32, kernels<Exec>()[0]);
+    for (const auto &v : VEC_SEED_U32)
+        CHECK(su32[v.index] == v.value);
+}
+
+// ---- Dumps --------------------------------------------------------------------------------
+
+template <class T> static std::vector<T> slurp(const std::string &dir, const char *file) {
+    std::string path = dir + "/" + file;
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        std::printf("FAIL cannot open %s\n", path.c_str());
+        failures++;
+        return {};
+    }
+    std::fseek(f, 0, SEEK_END);
+    size_t len = (size_t)std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<T> v(len / sizeof(T));
+    if (std::fread(v.data(), 1, len, f) != len)
+        failures++;
+    std::fclose(f);
+    return v;
+}
+
+template <class Exec, class E>
+static void check_dump(const std::string &dir, const char *file, const Key &key, uint32_t K) {
+    std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
+    if (want.empty())
+        return;
+    for (Kernel kernel : kernels<Exec>()) {
+        size_t i = first_diff(want, device_fill<Exec, E>(key, 0, K, want.size(), kernel));
+        CHECK(i == SIZE_MAX);
+        if (i != SIZE_MAX)
+            std::printf("  %s: %s fill differs at %zu\n", file, name(kernel), i);
+    }
+    size_t i = first_diff(want, device_draws<Exec, E>(key, 0, K, want.size()));
+    CHECK(i == SIZE_MAX);
+    if (i != SIZE_MAX)
+        std::printf("  %s: draws differ at %zu\n", file, i);
+}
+
+template <class Exec> static void test_dumps(const std::string &dir) {
+    const uint32_t k1234[4] = {1, 2, 3, 4};
+    const Key k = key_of(k1234), s42 = Rng(42).key();
+    check_dump<Exec, uint32_t>(dir, "k1234_K32_u32.bin", k, 32);
+    check_dump<Exec, uint64_t>(dir, "k1234_K32_u64.bin", k, 32);
+    check_dump<Exec, uint32_t>(dir, "k1234_K8_u32.bin", k, 8);
+    check_dump<Exec, double>(dir, "seed42_K32_f64.bin", s42, 32);
+    check_dump<Exec, float>(dir, "seed42_K32_f32.bin", s42, 32);
+    check_dump<Exec, bool>(dir, "seed42_K32_bool.bin", s42, 32);
+}
+
+// ---- Fills against draws at random keys, chunk lengths, positions, lengths, alignments ----
+
+struct Trial {
+    Key key;
+    uint32_t K;
+    uint64_t pos;
+    size_t n, shift;
+};
+
+static std::vector<Trial> trials(uint64_t seed, int count) {
+    std::mt19937_64 gen(seed);
+    std::vector<Trial> out;
+    for (int t = 0; t < count; t++) {
+        Trial x;
+        for (auto &w : x.key.w)
+            w = (uint32_t)gen();
+        x.K = 1u << (gen() % 9);
+        x.pos = gen() % (1u << 20);
+        x.n = (size_t)(gen() % (t < count * 3 / 4 ? 5000 : 200000));
+        x.shift = gen() % 4;
+        out.push_back(x);
+    }
+    return out;
+}
+
+template <class Exec, class E> static void check_against_draws(const char *label) {
+    for (const Trial &t : trials(2026, 24)) {
+        auto want = device_draws<Exec, E>(t.key, t.pos, t.K, t.n);
+        for (Kernel kernel : kernels<Exec>()) {
+            uint64_t end;
+            auto got = device_fill<Exec, E>(t.key, t.pos, t.K, t.n, kernel, t.shift, &end);
+            size_t i = first_diff(want, got);
+            CHECK(i == SIZE_MAX);
+            CHECK(end == tandem::align_pos(t.pos, bits_of<E>) + t.n * bits_of<E>);
+            if (i != SIZE_MAX)
+                std::printf("  %s %s fill vs draws (K=%u pos=%llu n=%zu shift=%zu) at %zu\n", label,
+                            name(kernel), t.K, (unsigned long long)t.pos, t.n, t.shift, i);
+        }
+    }
+}
+
+// A fill split in pieces, with host draws between them, continues one stream: the pieces and
+// the draws equal the u32 words of one whole fill.
+template <class Exec> static void test_split_fills() {
+    const uint32_t kw[4] = {0xdeadbeef, 7, 99, 0x12345678};
+    const Key key = key_of(kw);
+    for (uint32_t K : {1u, 8u, 32u}) {
+        const uint64_t start = 37; // inside row 0
+        const uint64_t base = tandem::align_pos(start, 32);
+        auto whole = device_fill<Exec, uint32_t>(key, start, K, 40000, Kernel::Chunk);
+        Rng r = Rng::from_key(key, start, K);
+        Kokkos::View<uint32_t *, typename Exec::memory_space> a("a", 1001);
+        Kokkos::View<uint64_t *, typename Exec::memory_space> b("b", 5003);
+        Kokkos::View<double *, typename Exec::memory_space> c("c", 3333);
+        std::vector<std::pair<uint64_t, unsigned>> at; // stream position and width of each value
+        std::vector<uint64_t> got;
+        bool ok = true;
+
+        auto take = [&](auto view) {
+            using E = typename decltype(view)::non_const_value_type;
+            uint64_t p = tandem::align_pos(r.position(), bits_of<E>);
+            tandem::fill(Exec(), view, r);
+            auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), view);
+            for (size_t i = 0; i < view.extent(0); i++) {
+                at.push_back({p + i * bits_of<E>, bits_of<E> == 32 ? 32u : 64u});
+                if constexpr (std::is_same_v<E, double>) {
+                    uint64_t raw = bits_at(whole, base, p + i * 64, 64);
+                    ok = ok && h(i) == tandem::to_f64(raw);
+                    got.push_back(raw);
+                } else {
+                    got.push_back((uint64_t)h(i));
+                }
+            }
+        };
+        take(a);
+        for (int i = 0; i < 3; i++) {
+            at.push_back({tandem::align_pos(r.position(), 32), 32});
+            got.push_back(r.urand());
+        }
+        take(b);
+        at.push_back({tandem::align_pos(r.position(), 64), 64});
+        got.push_back(r.urand64());
+        take(c);
+        for (size_t i = 0; i < got.size(); i++)
+            ok = ok && got[i] == bits_at(whole, base, at[i].first, at[i].second);
+        CHECK(ok);
+        CHECK(at.back().first + 64 <= base + 32 * whole.size());
+    }
+}
+
+// Mixed widths through one in-kernel generator read the stream at the aligned positions.
+template <class Exec> static void test_mixed_draws() {
+    const uint32_t kw[4] = {9, 8, 7, 6};
+    const Key key = key_of(kw);
+    constexpr int rounds = 2000;
+    Kokkos::View<uint64_t *, typename Exec::memory_space> v("mixed", 5 * rounds + 1);
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Exec>(0, 1), KOKKOS_LAMBDA(int) {
+            Rng r = Rng::from_key(key, 5, 32);
+            for (int i = 0; i < rounds; i++) {
+                v(5 * i + 0) = r.bit();
+                v(5 * i + 1) = r.urand();
+                double d = r.drand();
+                std::memcpy(&v(5 * i + 2), &d, 8);
+                v(5 * i + 3) = r.urand64();
+                float f = r.frand();
+                uint32_t fb;
+                std::memcpy(&fb, &f, 4);
+                v(5 * i + 4) = fb;
+            }
+            v(5 * rounds) = r.position();
+        });
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
+    auto words = device_fill<Exec, uint32_t>(key, 0, 32, 5 * rounds * 6, kernels<Exec>()[0]);
+    uint64_t p = 5;
+    bool ok = true;
+    auto next = [&](unsigned w) {
+        p = tandem::align_pos(p, w);
+        uint64_t x = bits_at(words, 0, p, w);
+        p += w;
+        return x;
+    };
+    for (int i = 0; i < rounds; i++) {
+        ok = ok && h(5 * i + 0) == next(1);
+        ok = ok && h(5 * i + 1) == next(32);
+        double d = tandem::to_f64(next(64));
+        ok = ok && std::memcmp(&h(5 * i + 2), &d, 8) == 0;
+        ok = ok && h(5 * i + 3) == next(64);
+        float f = tandem::to_f32((uint32_t)next(32));
+        uint32_t fb;
+        std::memcpy(&fb, &f, 4);
+        ok = ok && h(5 * i + 4) == fb;
+    }
+    CHECK(ok);
+    CHECK(h(5 * rounds) == p);
+
+    // Random access reads the fill that would start at the position.
+    Rng r = Rng::from_key(key, 5, 32);
+    CHECK(r.at_urand(0) == words[1] && r.at_urand(1000) == words[1001]);
+    CHECK(r.at_urand64(100) == bits_at(words, 0, 64 + 6400, 64));
+    CHECK(r.at_drand(3) == tandem::to_f64(bits_at(words, 0, 64 + 192, 64)));
+    CHECK(r.at_frand(7) == tandem::to_f32(words[8]));
+}
+
+// ---- Bounded and normal draws -------------------------------------------------------------
+
+template <class Exec> static void test_bounded() {
+    const Key key = Rng(7).key();
+    constexpr int n = 60000;
+    // Counts of urand(6), and violations of: bounds, the power-of-two identity
+    // urand(2^k) = urand() >> (32 - k), its 64-bit analogue, and the signed ranges.
+    Kokkos::View<int64_t[8], typename Exec::memory_space> c("counts");
+    Kokkos::View<double[2], typename Exec::memory_space> m("moments");
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Exec>(0, 1), KOKKOS_LAMBDA(int) {
+            Rng r = Rng::from_key(key, 0, 32);
+            Rng a = r, b = r;
+            int64_t bad = 0;
+            for (int i = 0; i < n; i++) {
+                c(r.urand(6u))++;
+                uint32_t big = r.urand(0x80000001u);
+                uint64_t big64 = r.urand64(0x8000000000000001ull);
+                int32_t s = r.rand(-5, 5);
+                int64_t s64 = r.rand64(-3, 1000);
+                bad += big > 0x80000000u || big64 > 0x8000000000000000ull || s < -5 || s >= 5 ||
+                       s64 < -3 || s64 >= 1000;
+                bad += a.urand(1u << 5) != b.urand() >> 27;
+                bad += a.urand64(1ull << 40) != b.urand64() >> 24;
+            }
+            c(6) = bad;
+            double s1 = 0, s2 = 0;
+            for (int i = 0; i < n; i++) {
+                double z = r.normal();
+                s1 += z;
+                s2 += z * z;
+            }
+            m(0) = s1 / n;
+            m(1) = s2 / n;
+        });
+    auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), c);
+    auto hm = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), m);
+    double chi2 = 0;
+    for (int k = 0; k < 6; k++)
+        chi2 += std::pow(hc(k) - n / 6.0, 2) / (n / 6.0);
+    CHECK(chi2 < 20.5); // 5 degrees of freedom, p = 0.001
+    CHECK(hc(6) == 0);
+    // Mean and second moment of a standard normal, within five standard errors.
+    CHECK(std::abs(hm(0)) < 5 / std::sqrt((double)n));
+    CHECK(std::abs(hm(1) - 1) < 5 * std::sqrt(2.0 / n));
+}
+
+// ---- Backends -----------------------------------------------------------------------------
+
+template <class Exec> static void run(const char *space, const std::string &dir) {
+    long c0 = checks, f0 = failures;
+    test_vectors<Exec>();
+    test_dumps<Exec>(dir);
+    check_against_draws<Exec, uint32_t>("u32");
+    check_against_draws<Exec, uint64_t>("u64");
+    check_against_draws<Exec, float>("f32");
+    check_against_draws<Exec, double>("f64");
+    check_against_draws<Exec, bool>("bool");
+    test_split_fills<Exec>();
+    test_mixed_draws<Exec>();
+    test_bounded<Exec>();
+    std::printf("%s: %ld checks, %ld failures\n", space, checks - c0, failures - f0);
+}
+
+// Every backend writes the bytes Serial writes, with every kernel it runs.
+template <class Exec, class E> static void same_as_serial(const char *space) {
+    for (const Trial &t : trials(77, 12)) {
+        auto want = device_fill<Kokkos::Serial, E>(t.key, t.pos, t.K, t.n, Kernel::Group);
+        for (Kernel kernel : kernels<Exec>()) {
+            auto got = device_fill<Exec, E>(t.key, t.pos, t.K, t.n, kernel, t.shift);
+            CHECK(std::memcmp(want.data(), got.data(), t.n * sizeof(E)) == 0);
+            if (std::memcmp(want.data(), got.data(), t.n * sizeof(E)) != 0)
+                std::printf("  %s %s differs from Serial\n", space, name(kernel));
+        }
+    }
+}
+
+template <class Exec> static void compare_with_serial(const char *space) {
+    long c0 = checks;
+    same_as_serial<Exec, uint32_t>(space);
+    same_as_serial<Exec, uint64_t>(space);
+    same_as_serial<Exec, float>(space);
+    same_as_serial<Exec, double>(space);
+    same_as_serial<Exec, bool>(space);
+    std::printf("%s vs Serial: %ld checks\n", space, checks - c0);
+}
+
+int main(int argc, char **argv) {
+    Kokkos::ScopeGuard guard(argc, argv);
+    std::string dir = argc > 1 ? argv[argc - 1] : "tests/data";
+    run<Kokkos::Serial>("Serial", dir);
+#ifdef KOKKOS_ENABLE_OPENMP
+    run<Kokkos::OpenMP>("OpenMP", dir);
+    compare_with_serial<Kokkos::OpenMP>("OpenMP");
+#endif
+#ifdef KOKKOS_ENABLE_CUDA
+    run<Kokkos::Cuda>("Cuda", dir);
+    compare_with_serial<Kokkos::Cuda>("Cuda");
+#endif
+    if (failures) {
+        std::printf("%ld of %ld checks failed\n", failures, checks);
+        return 1;
+    }
+    std::printf("ok: %ld checks\n", checks);
+    return 0;
+}
