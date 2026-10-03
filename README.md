@@ -15,8 +15,10 @@ bit, on every Kokkos backend.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
-- `include/tandem/core.hpp`: the specification's building blocks, `Rng` and an eight-lane row
-  in portable C++17 without Kokkos or CUDA types, meant as the shared base of HIP and SYCL ports.
+- `tandem/core.hpp`: the specification's building blocks, `Rng` and an eight-lane row in
+  portable C++17 without Kokkos or CUDA types. It comes from
+  [tandem-cuda](https://github.com/tandem-rng/tandem-cuda), a git submodule in
+  `external/tandem-cuda`.
 
 ## Use
 
@@ -70,7 +72,14 @@ output's blocks are 16-byte aligned.
 
 ## Build
 
-Header-only. With CMake, as a subdirectory or through `FetchContent` next to an existing Kokkos:
+Header-only. Clone with the submodule:
+
+```sh
+git clone --recurse-submodules https://github.com/tandem-rng/tandem-kokkos
+git submodule update --init           # in a clone made without it
+```
+
+With CMake, as a subdirectory or through `FetchContent` next to an existing Kokkos:
 
 ```cmake
 add_subdirectory(tandem-kokkos)        # finds Kokkos unless the Kokkos::kokkos target exists
@@ -88,7 +97,8 @@ find_package(tandem-kokkos REQUIRED)
 target_link_libraries(app PRIVATE tandem::kokkos)
 ```
 
-Without CMake, add `include/` to the include path of a Kokkos build. The headers need C++17,
+Without CMake, add `include/` and `external/tandem-cuda/include/` to the include path of a
+Kokkos build. The headers need C++17,
 Kokkos 5 itself needs C++20.
 
 `pixi.toml` provides Kokkos 5.2.1 with the Serial and OpenMP backends from conda-forge
@@ -155,7 +165,8 @@ kernel runs within 1% of tandem-cuda's direct kernel (1309 to 1324 GiB/s).
 
 ## Portable core
 
-`include/tandem/core.hpp` depends on nothing but the C++ standard library. `TANDEM_FN` expands
+`tandem/core.hpp` lives in tandem-cuda, which builds its CUDA kernels on it, and depends on
+nothing but the C++ standard library. `TANDEM_FN` expands
 to `KOKKOS_INLINE_FUNCTION` when Kokkos is included first, to `__host__ __device__ inline` under
 nvcc or hipcc, and to `inline` otherwise. It holds `T`, `F`, `F_keyed`, `block`, the stream
 position arithmetic, the float mappings, `Rng`, and `Row`, the eight lanes of a group. HIP and
