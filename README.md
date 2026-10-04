@@ -4,7 +4,7 @@
 
 [Kokkos](https://kokkos.org) implementation of [Tandem8x32](https://github.com/tandem-rng/spec),
 a noncryptographic pseudorandom number generator built to be fast on CPUs and GPUs alike. Two
-headers, C++17, no compiled library. It produces the stream the specification defines, bit for
+headers, C++20, no compiled library. It produces the stream the specification defines, bit for
 bit, on every Kokkos backend.
 
 - `tandem::fill(exec, view, rng)` and `tandem::fill(view, rng)`: fill a contiguous
@@ -32,7 +32,7 @@ bit, on every Kokkos backend.
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
 - `tandem/core.hpp`: the specification's building blocks, `Rng` and an eight-lane row in
-  portable C++17 without Kokkos or CUDA types. It comes from
+  portable C++ without Kokkos or CUDA types. It comes from
   [tandem-cuda](https://github.com/tandem-rng/tandem-cuda), a git submodule in
   `external/tandem-cuda`.
 
@@ -138,17 +138,25 @@ target_link_libraries(app PRIVATE tandem::kokkos)
 ```
 
 Without CMake, add `include/` and `external/tandem-cuda/include/` to the include path of a
-Kokkos build. The headers need C++17,
-Kokkos 5 itself needs C++20.
+Kokkos build. The headers need C++20, as Kokkos 5 does.
 
 `pixi.toml` provides Kokkos 5.2.1, the newest conda-forge build, with the Serial and OpenMP
-backends (`pixi run test`). The latest release is 5.2.2. The conda-forge package has no CUDA backend, so on a GPU host the `cuda`
-environment builds Kokkos 5.2.2 with Serial, OpenMP and CUDA from source into `build/`:
+backends (`pixi run test`), built with clang. The latest release is 5.2.2. `pixi run -e gcc test-gcc` builds
+the same with GCC 14 on Linux. The conda-forge package has no CUDA backend, so on a GPU host the `cuda`
+environment builds Kokkos 5.2.2 with Serial, OpenMP and CUDA from source into `build/`, with CUDA 12.8,
+clang 19 as the nvcc host compiler (`-ccbin`) and GCC 14 for its libstdc++. CUDA 13 needs a newer
+driver than the 570 on the GPU host, so the toolkit stays at 12.8:
 
 ```sh
 pixi run -e cuda kokkos               # KOKKOS_ARCH=AMPERE80 by default
 pixi run -e cuda test-cuda
 ```
+
+## Install
+
+The `packaging/` directory holds a Spack recipe (`spack/package.py`, with `openmp` and `cuda` variants)
+and a conda-forge style recipe (`conda/recipe.yaml`, Serial and OpenMP Kokkos). Neither is submitted to
+Spack or conda-forge yet, and both build from the `main` branch.
 
 ## Tests
 
@@ -165,8 +173,9 @@ scalar `normal2()` calls from random positions and counts, odd and even, and aga
 (`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: 16 ulps plus 1e-6 for float on CUDA, 8 ulps on host spaces, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
-`tools/gen_vectors.py`, and CI fails when it is out of date. CI runs the tests on Linux (GCC)
-and macOS (clang) with Serial and OpenMP, and once with `TANDEM_NO_SIMD`.
+`tools/gen_vectors.py`, and CI fails when it is out of date. CI runs the tests with Serial and OpenMP on Linux and macOS with clang, on Linux with GCC 14 as a
+compatibility check, and once with clang and `TANDEM_NO_SIMD`. GitHub runners have no GPU, so the CUDA
+tests run on a GPU host.
 
 ## Speed
 

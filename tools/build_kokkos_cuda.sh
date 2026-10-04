@@ -10,7 +10,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)/build/kokkos-cuda
 if [ ! -d "$root/src" ]; then
     git clone --depth 1 --branch "$tag" https://github.com/kokkos/kokkos "$root/src"
 fi
-export NVCC_WRAPPER_DEFAULT_COMPILER=${CXX:-g++}
+export NVCC_WRAPPER_DEFAULT_COMPILER=${NVCC_HOST:-clang++}
 cmake -S "$root/src" -B "$root/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$root/install" \

@@ -9,19 +9,28 @@ permissions:
   contents: read
 
 # Kokkos 5.2.1 from conda-forge has the Serial and OpenMP backends, and the test binary runs
-# every check on both. GitHub runners have no GPU: run the CUDA tests on a GPU host with the
+# every check on both. Clang is the primary compiler, one job builds with GCC 14. GitHub runners have no GPU: run the CUDA tests on a GPU host with the
 # pixi `cuda` environment.
 jobs:
   test:
-    name: ${{ matrix.os }}${{ matrix.flags && ' (TANDEM_NO_SIMD)' || '' }}
+    name: ${{ matrix.os }}, ${{ matrix.cxx }}${{ matrix.flags && ' (TANDEM_NO_SIMD)' || '' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            cxx: clang++
+            env: default
           - os: macos-latest
+            cxx: clang++
+            env: default
           - os: ubuntu-latest
+            cxx: g++
+            env: gcc
+          - os: ubuntu-latest
+            cxx: clang++
+            env: default
             flags: -DTANDEM_NO_SIMD
     steps:
       - uses: actions/checkout@v7
@@ -29,13 +38,14 @@ jobs:
           submodules: true
       - uses: prefix-dev/setup-pixi@v0.9.3
         with:
-          environments: default
+          environments: ${{ matrix.env }}
           locked: false
       - run: >
-          pixi run cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DTANDEM_BENCH=ON
+          pixi run -e ${{ matrix.env }} cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DTANDEM_BENCH=ON -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
           -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror ${{ matrix.flags }}"
-      - run: pixi run cmake --build build
-      - run: pixi run ctest --test-dir build --output-on-failure
+      - run: pixi run -e ${{ matrix.env }} cmake --build build
+      - run: pixi run -e ${{ matrix.env }} ctest --test-dir build --output-on-failure
         env:
           OMP_NUM_THREADS: 4
   vectors:

@@ -15,7 +15,7 @@ target_include_directories(tandem_kokkos INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external/tandem-cuda/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(tandem_kokkos INTERFACE Kokkos::kokkos)
-target_compile_features(tandem_kokkos INTERFACE cxx_std_17)
+target_compile_features(tandem_kokkos INTERFACE cxx_std_20)
 set_target_properties(tandem_kokkos PROPERTIES EXPORT_NAME kokkos)
 
 include(CMakePackageConfigHelpers)
