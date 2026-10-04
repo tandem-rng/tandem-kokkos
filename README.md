@@ -23,6 +23,8 @@ Needs C++20 and Kokkos 5. `external/tandem-cuda` is a submodule pinned at 5806e5
 Kokkos 5.2.2 with CUDA 12.8 and runs on a GPU host. Recipes for Spack and conda-forge sit in
 `packaging/`.
 
+Full notes on the API, kernels, tests and speed: [docs/notes.md](docs/notes.md).
+
 ## Use
 
 ```cpp
