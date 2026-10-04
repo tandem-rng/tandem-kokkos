@@ -179,6 +179,35 @@ KOKKOS_INLINE_FUNCTION void store_row(typename elem<Kind>::out_t *dst, const Row
         constexpr unsigned per_row = 1024 / elem<Kind>::bits, per_block = 128 / elem<Kind>::bits;
         uint32_t w[32];
         R.store(w);
+        if constexpr (std::is_same_v<Kind, below32>) {
+            /* The common row has no draw whose low product word is below the range, so none can
+             * reject, and a plain loop over the 32 products vectorizes. */
+            uint32_t hi[32], range = (uint32_t)s.range, low = 0;
+#ifdef TANDEM_ROW_SIMD
+            typedef uint32_t u32x4 __attribute__((vector_size(16)));
+            typedef uint64_t u64x4 __attribute__((vector_size(32)));
+            u32x4 under = {0, 0, 0, 0};
+            for (unsigned k = 0; k < 32; k += 4) {
+                u32x4 x;
+                std::memcpy(&x, w + k, 16);
+                u64x4 m = __builtin_convertvector(x, u64x4) * (uint64_t)range;
+                u32x4 h = __builtin_convertvector(m >> 32, u32x4);
+                under |= (u32x4)(__builtin_convertvector(m, u32x4) < range);
+                std::memcpy(hi + k, &h, 16);
+            }
+            low = under[0] | under[1] | under[2] | under[3];
+#else
+            for (unsigned k = 0; k < 32; k++) {
+                uint64_t m = (uint64_t)w[k] * range;
+                hi[k] = (uint32_t)(m >> 32);
+                low |= (uint32_t)m < range;
+            }
+#endif
+            if (!low) {
+                std::memcpy(dst, hi, sizeof hi);
+                return;
+            }
+        }
         for (unsigned k = 0; k < per_row; k++)
             dst[k] = elem<Kind>::make(w + 4 * (k / per_block), k % per_block, e0 + k, s);
     }
