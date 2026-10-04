@@ -172,6 +172,15 @@ nvcc or hipcc, and to `inline` otherwise. It holds `T`, `F`, `F_keyed`, `block`,
 position arithmetic, the float mappings, `Rng`, and `Row`, the eight lanes of a group. HIP and
 SYCL ports can reuse it and add only their fill kernels.
 
+## AI assistance
+
+This port was written with the help of large language models under human
+direction. The design and the specification are human work, as is much of the
+Julia implementation. The code is tested bit for bit against every vector of
+the specification and against long stream dumps from the Julia implementation,
+and every value must match. The output does not depend on who or what wrote the
+code.
+
 ## License
 
 Apache License 2.0. See `LICENSE` and `NOTICE`.
