@@ -716,9 +716,9 @@ void fill_below(const View &view, Rng &rng, typename View::non_const_value_type 
  * Rng::normalf2 or Rng::normal2 calls: pair j, the elements 2j and 2j + 1 with the cos half
  * first, is made from the draws 2j and 2j + 1 of the f32 or f64 fill. An odd count drops the
  * last sin half and still consumes both draws, so the fill takes 64 (float) or 128 (double)
- * bits per pair. An empty fill leaves the position alone. Device and host trigonometry differ
- * in the last bits, so normals agree across backends to a few ulps, not bit for bit. Not part
- * of the specification. */
+ * bits per pair. An empty fill leaves the position alone. Specification Appendix A. Double
+ * normals and host float normals equal tandem-c bit for bit. CUDA float normals take the fast
+ * __sincosf and agree to 16 ulps + 1e-6. */
 template <class Exec, class View> void fill_normal(const Exec &exec, const View &view, Rng &rng) {
     using E = typename View::non_const_value_type;
     static_assert(std::is_same_v<E, float> || std::is_same_v<E, double>,

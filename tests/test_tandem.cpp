@@ -621,23 +621,12 @@ template <class Exec> static void test_below() {
     }
 }
 
-// Normals agree across devices to a few ulps. The host's polynomial differs from the device's
-// sincospi near a zero of cos or sin by about 1e-15 in absolute terms, which the absolute floor
-// covers.
-template <class E> static bool near_normal(E got, E want, float ulps = 16.0f) {
-    if constexpr (std::is_same_v<E, double>)
-        return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-14;
-    else
-        return std::abs(got - want) <= ulps * 0x1p-23f * std::abs(want) + 1e-6f;
-}
-
-// A host fill runs core.hpp's explicit-fma Box-Muller, which equals the scalar normal2() calls
-// and the other host fills bit for bit. A device differs in the last bits.
+// Host normals and every double normal run core.hpp's explicit-fma polynomials and equal
+// tandem-c bit for bit. CUDA float normals take the fast __sincosf, within 16 ulps + 1e-6.
 template <class Exec, class E> static bool same_normal(E got, E want) {
-    if constexpr (tandem::detail::is_host<Exec>)
+    if (tandem::detail::is_host<Exec> || std::is_same_v<E, double>)
         return std::memcmp(&got, &want, sizeof got) == 0;
-    else
-        return near_normal(got, want);
+    return std::abs(got - want) <= 16 * 0x1p-23f * std::abs(want) + 1e-6f;
 }
 
 template <class Exec, class E>
@@ -688,7 +677,6 @@ template <class Exec, class E> static void check_normal(const char *label) {
     }
 }
 
-// The fixtures predate the explicit-fma core, so a host fill matches them to a tolerance only.
 // Fixtures from tandem-cuda at positions that put the first pair at an even and an odd draw,
 // with an odd count, and empty fills, which leave the position alone.
 template <class Exec> static void test_normal() {
@@ -702,7 +690,7 @@ template <class Exec> static void test_normal() {
         auto v = device_normal<Exec, double>(k42, f.pos, 32, f.n, 0, &end);
         bool ok = true;
         for (unsigned i = 0; i < f.n; i++)
-            ok = ok && near_normal(v[i], f.out[i]);
+            ok = ok && same_normal<Exec>(v[i], f.out[i]);
         CHECK(ok);
         CHECK(end == tandem::align_pos(f.pos, 64) + 128 * ((f.n + 1) / 2));
     }
@@ -711,23 +699,23 @@ template <class Exec> static void test_normal() {
         auto v = device_normal<Exec, float>(k42, f.pos, 32, f.n, 0, &end);
         bool ok = true;
         for (unsigned i = 0; i < f.n; i++)
-            ok = ok && near_normal(v[i], f.out[i]);
+            ok = ok && same_normal<Exec>(v[i], f.out[i]);
         CHECK(ok);
         CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
     }
 
-    // tandem-c's pair fixtures, after one Bool draw. Host spaces agree with its libm to 8 ulps.
+    // tandem-c's pair fixtures, after one Bool draw.
     constexpr size_t m = 2 * CROSS_NORMAL_COUNT;
     uint64_t end;
     auto d = device_normal<Exec, double>(k42, 1, 32, m, 0, &end);
     bool ok = end == CROSS_NORMAL_END_POS;
     for (size_t i = 0; i < m; i++)
-        ok = ok && near_normal(d[i], CROSS_NORMAL[i]);
+        ok = ok && same_normal<Exec>(d[i], CROSS_NORMAL[i]);
     CHECK(ok);
     auto f = device_normal<Exec, float>(k42, 1, 32, m, 0, &end);
     ok = end == CROSS_NORMALF_END_POS;
     for (size_t i = 0; i < m; i++)
-        ok = ok && near_normal(f[i], CROSS_NORMALF[i], tandem::detail::is_host<Exec> ? 8.0f : 16.0f);
+        ok = ok && same_normal<Exec>(f[i], CROSS_NORMALF[i]);
     CHECK(ok);
 
     device_normal<Exec, double>(k42, 1, 32, 0, 0, &end);
@@ -923,8 +911,7 @@ template <class Exec, class E> static void same_as_serial(const char *space) {
     }
 }
 
-// Bounded fills are integers and equal Serial's bytes. Normals equal them on host spaces and
-// agree to a few ulps on devices.
+// Bounded fills and double normals equal Serial's bytes.
 template <class Exec> static void same_as_serial_below_normal(const char *space) {
     for (const Trial &t : trials(78, 12)) {
         uint64_t e1, e2;
