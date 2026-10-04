@@ -1,0 +1,66 @@
+# conda-forge style recipe in the rattler-build v1 format. It is not submitted yet.
+# The conda-forge Kokkos package has the Serial and OpenMP backends only. A CUDA build needs
+# Kokkos built from source with its CUDA backend, as `pixi run -e cuda kokkos` does.
+context:
+  version: "0.1.0"
+
+package:
+  name: tandem-kokkos
+  version: ${{ version }}
+
+# No releases exist, so the source is the main branch with the tandem-cuda submodule. At
+# release time replace it with a tarball that carries external/tandem-cuda, since GitHub
+# archives omit submodules:
+#   url: https://github.com/tandem-rng/tandem-kokkos/releases/download/v${{ version }}/tandem-kokkos-${{ version }}.tar.gz
+#   sha256: <sha256 of that tarball>
+source:
+  git: https://github.com/tandem-rng/tandem-kokkos.git
+  branch: main
+
+build:
+  number: 0
+
+requirements:
+  build:
+    - ${{ compiler('cxx') }}
+    - ${{ stdlib('c') }}
+    - cmake >=3.25
+    - ninja
+  host:
+    - kokkos >=5.2.1
+    - if: osx
+      then: llvm-openmp
+  run:
+    - kokkos >=5.2.1
+
+tests:
+  - package_contents:
+      include:
+        - tandem/kokkos.hpp
+        - tandem/core.hpp
+      files:
+        - lib/cmake/tandem-kokkos/tandem-kokkosConfig.cmake
+  - script:
+      - cd test_consumer
+      - cmake -S . -B build -G Ninja
+      - cmake --build build
+      - OMP_PROC_BIND=false ./build/use
+    files:
+      recipe:
+        - test_consumer/
+    requirements:
+      run:
+        - ${{ compiler('cxx') }}
+        - cmake
+        - ninja
+        - kokkos >=5.2.1
+        - if: osx
+          then: llvm-openmp
+
+about:
+  homepage: https://github.com/tandem-rng/tandem-kokkos
+  license: Apache-2.0
+  license_file:
+    - LICENSE
+    - NOTICE
+  summary: Tandem8x32 random number generator for Kokkos

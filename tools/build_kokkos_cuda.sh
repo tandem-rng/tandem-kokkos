@@ -3,7 +3,7 @@
 # the pixi `cuda` environment. KOKKOS_ARCH picks the GPU, Ampere 8.0 (A100) by default.
 set -euo pipefail
 
-tag=${KOKKOS_TAG:-5.2.1}
+tag=${KOKKOS_TAG:-5.2.2}
 arch=${KOKKOS_ARCH:-AMPERE80}
 root=$(cd "$(dirname "$0")/.." && pwd)/build/kokkos-cuda
 

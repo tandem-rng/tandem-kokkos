@@ -135,9 +135,9 @@ Without CMake, add `include/` and `external/tandem-cuda/include/` to the include
 Kokkos build. The headers need C++17,
 Kokkos 5 itself needs C++20.
 
-`pixi.toml` provides Kokkos 5.2.1 with the Serial and OpenMP backends from conda-forge
-(`pixi run test`). The conda-forge package has no CUDA backend, so on a GPU host the `cuda`
-environment builds Kokkos 5.2.1 with Serial, OpenMP and CUDA from source into `build/`:
+`pixi.toml` provides Kokkos 5.2.1, the newest conda-forge build, with the Serial and OpenMP
+backends (`pixi run test`). The latest release is 5.2.2. The conda-forge package has no CUDA backend, so on a GPU host the `cuda`
+environment builds Kokkos 5.2.2 with Serial, OpenMP and CUDA from source into `build/`:
 
 ```sh
 pixi run -e cuda kokkos               # KOKKOS_ARCH=AMPERE80 by default
@@ -185,36 +185,36 @@ At 2^24 elements the Serial fill runs within 5% of tandem-c's single-thread fill
 machine. The chunk
 kernel, one scalar chunk per work item, shows what the vector row buys.
 
-NVIDIA A100 40 GB (PCIe), CUDA 12.8, Kokkos 5.2.1 built for `AMPERE80`, the GPU idle before each
+NVIDIA A100 40 GB (PCIe), CUDA 12.8, Kokkos 5.2.2 built for `AMPERE80`, the GPU idle before each
 run. Time per fill over eight back-to-back fills and one fence:
 
 | | elements | `uint32_t` | `uint64_t` | `float` | `double` |
 |---|---|---|---|---|---|
-| `tandem::fill`, tile kernel | 2^26 | 1282 | 1314 | 1282 | 1311 |
-| `tandem::fill`, tile kernel | 2^28 | 1332 | 1341 | 1334 | 1344 |
-| chunk kernel | 2^26 | 1272 | 1292 | 1267 | 1289 |
-| chunk kernel | 2^28 | 1310 | 1313 | 1305 | 1305 |
-| `Kokkos::fill_random`, `Random_XorShift64_Pool` | 2^26 | 91 | 127 | 91 | 97 |
-| `Kokkos::fill_random`, `Random_XorShift64_Pool` | 2^28 | 95 | 130 | 95 | 105 |
-| tandem-cuda tile kernel, `cudaEvent` timing, same session | 2^28 | 1385 | 1394 | 1379 | 1393 |
+| `tandem::fill`, tile kernel | 2^26 | 1278 | 1313 | 1285 | 1312 |
+| `tandem::fill`, tile kernel | 2^28 | 1329 | 1342 | 1339 | 1345 |
+| chunk kernel | 2^26 | 1278 | 1298 | 1268 | 1286 |
+| chunk kernel | 2^28 | 1309 | 1315 | 1306 | 1312 |
+| `Kokkos::fill_random`, `Random_XorShift64_Pool` | 2^26 | 91 | 127 | 92 | 97 |
+| `Kokkos::fill_random`, `Random_XorShift64_Pool` | 2^28 | 95 | 130 | 96 | 104 |
+| tandem-cuda tile kernel, `cudaEvent` timing, earlier session | 2^28 | 1385 | 1394 | 1379 | 1393 |
 
 The other fills on the same GPU, GiB/s written, eight back-to-back fills per run, `tandem::fill_below`
 with range 1000:
 
 | | elements | GiB/s |
 |---|---|---|
-| `fill`, `uint8_t` | 2^26 | 1088 |
+| `fill`, `uint8_t` | 2^26 | 1093 |
 | `fill`, `uint8_t` | 2^28 | 1245 |
-| `fill`, `Kokkos::complex<double>` | 2^26 | 1324 |
-| `fill`, `Kokkos::complex<double>` | 2^28 | 1345 |
-| `fill_below`, `uint32_t` | 2^26 | 1276 |
+| `fill`, `Kokkos::complex<double>` | 2^26 | 1330 |
+| `fill`, `Kokkos::complex<double>` | 2^28 | 1349 |
+| `fill_below`, `uint32_t` | 2^26 | 1275 |
 | `fill_below`, `uint32_t` | 2^28 | 1342 |
-| `fill_below`, `uint64_t` | 2^26 | 1285 |
-| `fill_below`, `uint64_t` | 2^28 | 1320 |
-| `fill_normal`, `float` | 2^26 | 1086 |
-| `fill_normal`, `float` | 2^28 | 1115 |
-| `fill_normal`, `double` | 2^26 | 683 |
-| `fill_normal`, `double` | 2^28 | 683 |
+| `fill_below`, `uint64_t` | 2^26 | 1309 |
+| `fill_below`, `uint64_t` | 2^28 | 1328 |
+| `fill_normal`, `float` | 2^26 | 1091 |
+| `fill_normal`, `float` | 2^28 | 1100 |
+| `fill_normal`, `double` | 2^26 | 674 |
+| `fill_normal`, `double` | 2^28 | 686 |
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
 fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. A normal pair costs a logarithm, a square root, a sine and a cosine and two

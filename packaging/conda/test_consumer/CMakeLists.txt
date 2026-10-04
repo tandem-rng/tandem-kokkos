@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.25)
+project(use LANGUAGES CXX)
+find_package(tandem-kokkos REQUIRED)
+add_executable(use use.cpp)
+target_link_libraries(use PRIVATE tandem::kokkos)
