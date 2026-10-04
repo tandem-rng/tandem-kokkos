@@ -31,6 +31,8 @@ class TandemKokkos(CMakePackage):
     depends_on("cxx", type="build")
     depends_on("cmake@3.25:", type="build")
     depends_on("kokkos@4.5:")
+    # The tests also run on the Serial space.
+    depends_on("kokkos+serial")
     depends_on("kokkos+openmp", when="+openmp")
     depends_on("kokkos+cuda+wrapper", when="+cuda")
     for _arch in ("70", "75", "80", "86", "89", "90"):

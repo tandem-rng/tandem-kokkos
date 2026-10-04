@@ -232,7 +232,7 @@ with range 1000:
 | `fill_normal`, `double` | 2^28 | 686 |
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
-fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. A normal pair costs a logarithm, a square root, a sine and a cosine and two
+fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. The CUDA normal fills run below tandem-cuda's own kernels on the same GPU (1100 and 686 GiB/s against 1290 and 765 at 2^28), a known gap with no further tuning planned. A normal pair costs a logarithm, a square root, a sine and a cosine and two
 draws. The `uint8_t` fill writes one byte per draw and the 2^26 case runs 15% below 2^28.
 
 Timing every fill alone with its own fence lowers the 2^26 figures by up to 3.2% and the 2^28
