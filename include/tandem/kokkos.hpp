@@ -131,7 +131,7 @@ KOKKOS_FORCEINLINE_FUNCTION void store_block(typename elem<Kind>::out_t *out, co
                                              uint64_t P, const uint32_t w[4]) {
     using O = typename elem<Kind>::out_t;
     constexpr unsigned bits = elem<Kind>::bits, per_block = 128 / bits;
-    if constexpr (ALIGNED && bits >= 32) {
+    if constexpr (ALIGNED && sizeof(O) * per_block == 16) {
         if (P >= s.p0 && P + 128u <= s.p1) {
             struct alignas(16) Vec {
                 O v[per_block];
@@ -336,7 +336,8 @@ void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rn
     set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
     /* Blocks land on 16-byte addresses when the output's first byte and the fill's first
      * stream byte agree modulo 16. */
-    if (bits >= 32 && ((reinterpret_cast<uintptr_t>(out) - s.p0 / 8) & 15u) == 0)
+    if (sizeof(typename elem<Kind>::out_t) * 8 == bits && bits >= 8 &&
+        ((reinterpret_cast<uintptr_t>(out) - s.p0 / 8) & 15u) == 0)
         fill_with<Kind, true>(exec, s, out, kernel);
     else
         fill_with<Kind, false>(exec, s, out, kernel);

@@ -299,6 +299,8 @@ static std::vector<Trial> trials(uint64_t seed, int count) {
         x.shift = gen() % 4;
         out.push_back(x);
     }
+    // Position 0 and shift 0 put every block of the output on a 16-byte address.
+    out.push_back(Trial{out.back().key, 32, 0, 5000, 0});
     return out;
 }
 
