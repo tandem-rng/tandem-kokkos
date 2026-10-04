@@ -495,6 +495,68 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
         });
 }
 
+/* Normal fill on host spaces: a work item steps the eight chunks of a group together and turns
+ * the pairs that end in each row into normals with one normal_block call, which the compiler
+ * vectorizes. The stream slots of a row are its 32 words, and the pairs are the L-word windows
+ * at slots S + j L. A pair that starts in the previous row takes its first words from the
+ * last three words of that row, `tail`, which for the first row of a group is the last block
+ * of the previous group. */
+template <class O, class Exec> void fill_normal_group(const Exec &exec, const Span s, O *out) {
+    constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
+    const uint64_t S = s.p0 >> 5, pairs = (s.p1 - s.p0) / (32u * L), n = s.range;
+    Kokkos::parallel_for(
+        "tandem::fill_normal (group)",
+        Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, (int64_t)s.g0,
+                                                              (int64_t)s.g1 + 1),
+        KOKKOS_LAMBDA(int64_t g) {
+            Row R;
+            R.seed(s.key.w, (uint64_t)g);
+            uint64_t row = (uint64_t)g * s.K;
+            uint32_t w[35] = {0, 0, 0}; /* the three words before the row, then the row */
+            if (g > 0 && S % L) {
+                uint32_t q[4];
+                block(s.key.w, 8u * ((uint64_t)g - 1u) + 7u, s.K - 1u, q);
+                w[0] = q[1];
+                w[1] = q[2];
+                w[2] = q[3];
+            }
+            uint32_t j1 = (uint32_t)(s.r1 - row < s.K - 1u ? s.r1 - row : s.K - 1u);
+            for (uint32_t j = 0; j <= j1; j++) {
+                R.step();
+                R.store(w + 3);
+                uint64_t r = row + j, base = 32u * r;
+                uint64_t lo = base + 1u > S + L ? base + 1u : S + L;
+                uint64_t rem = (lo - S) % L;
+                uint64_t t0 = rem ? lo + (L - rem) : lo;
+                if (t0 <= base + 32u && r >= s.r0) {
+                    O u[32], z[32];
+                    unsigned m = 0;
+                    uint64_t first = (t0 - S) / L - 1u;
+                    for (uint64_t t = t0; t <= base + 32u && first + m < pairs; t += L, m++) {
+                        const uint32_t *v = w + (t - L - base + 3u);
+                        if constexpr (L == 4) {
+                            u[2 * m] = to_f64(v[0] | ((uint64_t)v[1] << 32));
+                            u[2 * m + 1] = to_f64(v[2] | ((uint64_t)v[3] << 32));
+                        } else {
+                            u[2 * m] = to_f32(v[0]);
+                            u[2 * m + 1] = to_f32(v[1]);
+                        }
+                    }
+                    if constexpr (L == 4)
+                        normal_block_f64(u, z, m);
+                    else
+                        normal_block_f32(u, z, m);
+                    for (unsigned q = 0; q < 2 * m; q++)
+                        if (2 * first + q < n)
+                            out[2 * first + q] = z[q];
+                }
+                w[0] = w[32];
+                w[1] = w[33];
+                w[2] = w[34];
+            }
+        });
+}
+
 template <class Exec, class O>
 void fill_normal_ptr(const Exec &exec, O *out, uint64_t n, Rng &rng) {
     constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
@@ -506,10 +568,14 @@ void fill_normal_ptr(const Exec &exec, O *out, uint64_t n, Rng &rng) {
     s.range = n;
     uint64_t S = s.p0 >> 5, ba = (S + L - 1u) >> 2, bb = (S + pairs * L - 1u) >> 2;
     set_rows(s, ba, bb);
-    if (S % L)
-        fill_normal_chunk<O, true>(exec, s, ba, bb, out);
-    else
-        fill_normal_chunk<O, false>(exec, s, ba, bb, out);
+    if constexpr (is_host<Exec>) {
+        fill_normal_group<O>(exec, s, out);
+    } else {
+        if (S % L)
+            fill_normal_chunk<O, true>(exec, s, ba, bb, out);
+        else
+            fill_normal_chunk<O, false>(exec, s, ba, bb, out);
+    }
 }
 
 /* What a View's value type draws: the kind of fill, and how many of its elements one value

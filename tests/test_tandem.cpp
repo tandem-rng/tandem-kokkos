@@ -621,9 +621,10 @@ template <class Exec> static void test_below() {
     }
 }
 
-// Normals agree across libms to a few ulps. Host spaces share the host's libm. The host takes
-// the angle 2 pi b rounded, so near a zero of cos or sin it is off by about 1e-15 in absolute
-// terms from the device's sincospi, which the absolute floor covers.
+// Normals agree across devices and hardware to a few ulps. A host fill does the arithmetic of
+// the scalar normal2() calls and equals them exactly. The host's polynomial differs from the
+// device's sincospi near a zero of cos or sin by about 1e-15 in absolute terms, which the
+// absolute floor covers, and fused multiply-adds change the last bit between machines.
 template <class E> static bool near_normal(E got, E want, float ulps = 16.0f) {
     if constexpr (std::is_same_v<E, double>)
         return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-14;
@@ -670,7 +671,7 @@ template <class Exec, class E> static void check_normal(const char *label) {
         auto got = device_normal<Exec, E>(t.key, t.pos, t.K, t.n, t.shift, &end);
         bool ok = true;
         for (size_t i = 0; i < t.n; i++)
-            ok = ok && near_normal(got[i], want[i]);
+            ok = ok && (tandem::detail::is_host<Exec> ? got[i] == want[i] : near_normal(got[i], want[i]));
         CHECK(ok);
         CHECK(end == r.position());
         if (!ok)
