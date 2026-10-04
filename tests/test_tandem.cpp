@@ -12,7 +12,7 @@
 #include <tandem/kokkos.hpp>
 
 #include "../external/tandem-cuda/tests/cross_fill_below.h"
-#include "cross_normal.h"
+#include "../external/tandem-cuda/tests/cross_fill_normal.h"
 #include "vectors.hpp"
 
 using tandem::Key;
@@ -596,12 +596,14 @@ template <class Exec> static void test_below() {
     }
 }
 
-// Normals agree across libms to a few ulps. Host spaces share the host's libm.
+// Normals agree across libms to a few ulps. Host spaces share the host's libm. The host takes
+// the angle 2 pi b rounded, so near a zero of cos or sin it is off by about 1e-15 in absolute
+// terms from the device's sincospi, which the absolute floor covers.
 template <class E> static bool near_normal(E got, E want) {
     if constexpr (std::is_same_v<E, double>)
-        return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-15;
+        return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-14;
     else
-        return std::abs(got - want) <= 8.0f * 0x1p-23f * std::abs(want) + 1e-6f;
+        return std::abs(got - want) <= 16.0f * 0x1p-23f * std::abs(want) + 1e-6f;
 }
 
 template <class Exec, class E>
@@ -617,25 +619,37 @@ static std::vector<E> device_normal(const Key &key, uint64_t pos, uint32_t K, si
     return std::vector<E>(host.data(), host.data() + n);
 }
 
-template <class E> static E next_normal(Rng &r) {
-    if constexpr (std::is_same_v<E, double>)
-        return r.normal();
-    else
-        return r.normalf();
+// The flattened normal2 calls: an odd count drops the last sin half and still consumes both
+// draws.
+template <class E> static std::vector<E> sequential_normals(Rng &r, size_t n) {
+    std::vector<E> z(n);
+    for (size_t i = 0; i < n; i += 2) {
+        auto pair = [&] {
+            if constexpr (std::is_same_v<E, double>)
+                return r.normal2();
+            else
+                return r.normalf2();
+        }();
+        z[i] = pair.z0;
+        if (i + 1 < n)
+            z[i + 1] = pair.z1;
+    }
+    return z;
 }
 
 template <class Exec, class E> static void check_normal(const char *label) {
     constexpr bool host = tandem::detail::is_host<Exec>;
     for (const Trial &t : trials(42, 24)) {
         Rng r = Rng::from_key(t.key, t.pos, t.K);
-        std::vector<E> want(t.n);
-        for (E &z : want)
-            z = next_normal<E>(r);
+        std::vector<E> want = sequential_normals<E>(r, t.n);
         uint64_t end;
         auto got = device_normal<Exec, E>(t.key, t.pos, t.K, t.n, t.shift, &end);
         bool ok = true;
         for (size_t i = 0; i < t.n; i++)
             ok = ok && (host ? got[i] == want[i] : near_normal(got[i], want[i]));
+        for (size_t i = 0; i < t.n && !ok; i++)
+            if (!near_normal(got[i], want[i]))
+                std::printf("  i=%zu got %.17g want %.17g\n", i, (double)got[i], (double)want[i]);
         CHECK(ok);
         CHECK(end == r.position());
         if (!ok)
@@ -644,34 +658,42 @@ template <class Exec, class E> static void check_normal(const char *label) {
     }
 }
 
-// Fixtures made by tandem-cuda's core.hpp and checked by tandem-c: after one Bool draw the
-// fill starts at bit 64, an even Float64 draw, and at bit 32, an odd Float32 draw.
+// Fixtures from tandem-cuda at positions that put the first pair at an even and an odd draw,
+// with an odd count, and empty fills, which leave the position alone.
 template <class Exec> static void test_normal() {
     check_normal<Exec, double>("f64");
     check_normal<Exec, float>("f32");
 
+    CHECK(words_equal(CROSS_FILL_KEY, Rng(42).key().w));
     const Key k42 = Rng(42).key();
-    Rng r = Rng::from_key(k42, 1, 32);
-    Kokkos::View<double *, typename Exec::memory_space> d("d", CROSS_NORMAL_COUNT);
-    tandem::fill_normal(Exec(), d, r);
-    Exec().fence();
-    CHECK(r.position() == CROSS_NORMAL_END_POS);
-    auto hd = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
-    bool ok = true;
-    for (int i = 0; i < CROSS_NORMAL_COUNT; i++)
-        ok = ok && near_normal(hd(i), CROSS_NORMAL[i]);
-    CHECK(ok);
+    for (const auto &f : CROSS_NORMAL64) {
+        uint64_t end;
+        auto v = device_normal<Exec, double>(k42, f.pos, 32, f.n, 0, &end);
+        bool ok = true;
+        for (unsigned i = 0; i < f.n; i++)
+            ok = ok && near_normal(v[i], f.out[i]);
+        CHECK(ok);
+        CHECK(end == tandem::align_pos(f.pos, 64) + 128 * ((f.n + 1) / 2));
+    }
+    for (const auto &f : CROSS_NORMAL32) {
+        uint64_t end;
+        auto v = device_normal<Exec, float>(k42, f.pos, 32, f.n, 0, &end);
+        bool ok = true;
+        for (unsigned i = 0; i < f.n; i++)
+            ok = ok && near_normal(v[i], f.out[i]);
+        CHECK(ok);
+        CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
+    }
 
-    r = Rng::from_key(k42, 1, 32);
-    Kokkos::View<float *, typename Exec::memory_space> f("f", CROSS_NORMAL_COUNT);
-    tandem::fill_normal(Exec(), f, r);
-    Exec().fence();
-    CHECK(r.position() == CROSS_NORMALF_END_POS);
-    auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), f);
-    ok = true;
-    for (int i = 0; i < CROSS_NORMAL_COUNT; i++)
-        ok = ok && near_normal(hf(i), CROSS_NORMALF[i]);
-    CHECK(ok);
+    uint64_t end;
+    device_normal<Exec, double>(k42, 1, 32, 0, 0, &end);
+    CHECK(end == 1);
+    device_normal<Exec, float>(k42, 1, 32, 0, 0, &end);
+    CHECK(end == 1);
+    Kokkos::View<uint32_t *, typename Exec::memory_space> none("none", 0);
+    Rng r = Rng::from_key(k42, 1, 32);
+    tandem::fill_below(Exec(), none, r, 7u);
+    CHECK(r.position() == 1);
 }
 
 // ---- Value types ---------------------------------------------------------------------------

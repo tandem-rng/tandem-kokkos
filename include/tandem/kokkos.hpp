@@ -343,15 +343,16 @@ void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rn
         fill_with<Kind, false>(exec, s, out, kernel);
 }
 
-/* Normal fill by Box-Muller, element i from the L = 2 (float) or 4 (double) 32-bit stream
- * slots that start at slot S + i L, S being the first slot of the fill. A work item owns the
- * blocks that hold the last slot of an element. With S % L != 0 an element can start in the
+/* Normal fill by Box-Muller pairs: pair j, the elements 2j and 2j + 1, comes from the L = 2
+ * (float) or 4 (double) 32-bit stream slots that start at slot S + j L, S being the first slot
+ * of the fill, with the cos half first. A work item owns the blocks that hold the last slot of
+ * a pair. s.range is the element count, which an odd count leaves one past the last pair. With S % L != 0 an element can start in the
  * previous block, so the item also steps the chunk of that block, which for lane 0 is lane 7
  * one step back, or at step 0 the previous group's last chunk. */
 template <class O, bool STRADDLE, class Exec>
 void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb, O *out) {
     constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
-    const uint64_t S = s.p0 >> 5, n = (s.p1 - s.p0) / (32u * L);
+    const uint64_t S = s.p0 >> 5, pairs = (s.p1 - s.p0) / (32u * L), n = s.range;
     Kokkos::parallel_for(
         "tandem::fill_normal",
         Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, 0,
@@ -389,14 +390,18 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
                     if (last < S + L || (last - S) % L)
                         continue;
                     uint64_t i = (last - S) / L - 1u;
-                    if (i >= n)
+                    if (i >= pairs)
                         continue;
                     const uint32_t *v = x + (m + 5u - L);
+                    Pair2<O> z;
                     if constexpr (L == 4)
-                        dst[i] = box_muller(to_f64(v[0] | ((uint64_t)v[1] << 32)),
-                                            to_f64(v[2] | ((uint64_t)v[3] << 32)));
+                        z = box_muller2(to_f64(v[0] | ((uint64_t)v[1] << 32)),
+                                        to_f64(v[2] | ((uint64_t)v[3] << 32)));
                     else
-                        dst[i] = box_muller_f32(to_f32(v[0]), to_f32(v[1]));
+                        z = box_muller2_f32(to_f32(v[0]), to_f32(v[1]));
+                    dst[2 * i] = z.z0;
+                    if (2 * i + 1 < n)
+                        dst[2 * i + 1] = z.z1;
                 }
             }
         });
@@ -405,10 +410,13 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
 template <class Exec, class O>
 void fill_normal_ptr(const Exec &exec, O *out, uint64_t n, Rng &rng) {
     constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
-    Span s;
-    if (!plan_span(rng, n, 32u * L / 2u, 32u * L, s))
+    if (n == 0) /* no draws, so no alignment either */
         return;
-    uint64_t S = s.p0 >> 5, ba = (S + L - 1u) >> 2, bb = (S + n * L - 1u) >> 2;
+    uint64_t pairs = (n + 1u) / 2u;
+    Span s;
+    plan_span(rng, pairs, 32u * L / 2u, 32u * L, s);
+    s.range = n;
+    uint64_t S = s.p0 >> 5, ba = (S + L - 1u) >> 2, bb = (S + pairs * L - 1u) >> 2;
     set_rows(s, ba, bb);
     if (S % L)
         fill_normal_chunk<O, true>(exec, s, ba, bb, out);
@@ -528,6 +536,8 @@ void fill_below(const Exec &exec, const View &view, Rng &rng,
                       (sizeof(E) == 4 || sizeof(E) == 8),
                   "tandem::fill_below: the value type must be uint32_t or uint64_t");
     detail::check_view<Exec>(view, "tandem::fill_below");
+    if (view.size() == 0) /* no draws, so no alignment either */
+        return;
     using Kind = std::conditional_t<sizeof(E) == 4, detail::below32, detail::below64>;
     detail::fill_kind<Exec, Kind>(exec, reinterpret_cast<typename detail::elem<Kind>::out_t *>(
                                             view.data()),
@@ -540,11 +550,13 @@ void fill_below(const View &view, Rng &rng, typename View::non_const_value_type 
     exec.fence("tandem::fill_below: fence after the fill");
 }
 
-/* Standard normals in a float or double View by Box-Muller, as Rng::normalf and Rng::normal:
- * element i is made from the draws 2i and 2i + 1 of the f32 fill (float, 64 n bits in all) or
- * the f64 fill (double, 128 n bits). Device log and cos differ from the host's in the last
- * bits, so normals agree across backends to a few ulps, not bit for bit. Not part of the
- * specification. */
+/* Standard normals in a float or double View by Box-Muller, the flattened sequence of
+ * Rng::normalf2 or Rng::normal2 calls: pair j, the elements 2j and 2j + 1 with the cos half
+ * first, is made from the draws 2j and 2j + 1 of the f32 or f64 fill. An odd count drops the
+ * last sin half and still consumes both draws, so the fill takes 64 (float) or 128 (double)
+ * bits per pair. An empty fill leaves the position alone. Device and host trigonometry differ
+ * in the last bits, so normals agree across backends to a few ulps, not bit for bit. Not part
+ * of the specification. */
 template <class Exec, class View> void fill_normal(const Exec &exec, const View &view, Rng &rng) {
     using E = typename View::non_const_value_type;
     static_assert(std::is_same_v<E, float> || std::is_same_v<E, double>,

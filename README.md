@@ -23,9 +23,11 @@ bit, on every Kokkos backend.
   of `sub(PURPOSE_BELOW32)` (or `64`), so a fill without rejections equals the sequential
   `urand(range)` calls and the rare rejection costs no coordination.
 - `tandem::fill_normal(view, rng)`: standard normals in a `float` or `double` View by
-  Box-Muller, as `Rng::normalf` and `Rng::normal`. A `float` element takes two Float32 draws
-  (64 bits), a `double` element two Float64 draws (128 bits), element `i` from draws `2i` and
-  `2i + 1`. Both fills have `exec` forms like `fill`.
+  Box-Muller, the flattened sequence of `Rng::normalf2` or `Rng::normal2` calls. Pair `j`, the
+  elements `2j` and `2j + 1` with the cos half first, comes from the draws `2j` and `2j + 1` of
+  the Float32 (Float64) fill, one work item per pair. An odd count drops the last sin half and
+  still consumes both draws, 64 (128) bits per pair. An empty fill leaves the position alone.
+  Both fills have `exec` forms like `fill`.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
@@ -66,7 +68,8 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 | `bit()`, `urand()`, `urand64()`, `frand()`, `drand()` | the specification's Bool, UInt32, UInt64, Float32 and Float64 draws |
 | `at_urand(i)`, `at_urand64(i)`, `at_frand(i)`, `at_drand(i)` | element `i` of the fill that would start here, without advancing |
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
-| `normal()`, `normal(mean, sd)` | Box-Muller from two Float64 draws |
+| `normal()`, `normalf()`, `normal(mean, sd)` | the cos half of a Box-Muller step from two Float64 or Float32 draws |
+| `normal2()`, `normalf2()` | both halves of the step as a pair `z0`, `z1` |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
 
@@ -80,7 +83,7 @@ Bounded and normal draws are not part of the specification, so other ports may p
 values for them. The bounded and normal fills follow the contract in `core.hpp` and the same
 fills in tandem-cuda. Device `log` and `cos` differ from the host's in the last bits, so a
 normal fill agrees across backends to a few ulps, not bit for bit. Host backends write the
-values of the scalar `normal()` and `normalf()` exactly. The method names and the `MAX_*` constants follow the Kokkos generators, so
+values of the scalar `normal2()` and `normalf2()` calls exactly. The method names and the `MAX_*` constants follow the Kokkos generators, so
 `Kokkos::rand<tandem::Rng, T>::draw(rng, ...)` works.
 
 ### No `Kokkos::fill_random` pool
@@ -152,8 +155,8 @@ one stream, checks mixed-width draws, random access, derived keys and fork posit
 the bounded and normal draws. Bounded fills are checked against the contract in `core.hpp`
 written out on host generators, against the sequential `urand(range)` calls, and against
 fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
-scalar draws from random positions, odd and even, and against fixtures from tandem-cuda
-(`tests/cross_normal.h`, 8 ulps plus 1e-6 for float, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
+scalar `normal2()` calls from random positions and counts, odd and even, and against fixtures from tandem-cuda
+(`cross_fill_normal.h`, 16 ulps plus 1e-6 for float, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`, and CI fails when it is out of date. CI runs the tests on Linux (GCC)
@@ -204,17 +207,17 @@ with range 1000:
 | `fill`, `uint8_t` | 2^28 | 1245 |
 | `fill`, `Kokkos::complex<double>` | 2^26 | 1324 |
 | `fill`, `Kokkos::complex<double>` | 2^28 | 1345 |
-| `fill_below`, `uint32_t` | 2^26 | 1273 |
-| `fill_below`, `uint32_t` | 2^28 | 1341 |
-| `fill_below`, `uint64_t` | 2^26 | 1295 |
+| `fill_below`, `uint32_t` | 2^26 | 1276 |
+| `fill_below`, `uint32_t` | 2^28 | 1342 |
+| `fill_below`, `uint64_t` | 2^26 | 1285 |
 | `fill_below`, `uint64_t` | 2^28 | 1320 |
-| `fill_normal`, `float` | 2^26 | 378 |
-| `fill_normal`, `float` | 2^28 | 380 |
-| `fill_normal`, `double` | 2^26 | 337 |
-| `fill_normal`, `double` | 2^28 | 344 |
+| `fill_normal`, `float` | 2^26 | 630 |
+| `fill_normal`, `float` | 2^28 | 634 |
+| `fill_normal`, `double` | 2^26 | 613 |
+| `fill_normal`, `double` | 2^28 | 624 |
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
-fill of the same width. A normal element costs a logarithm, a square root and a cosine and two
+fill of the same width. A normal pair costs a logarithm, a square root, a sine and a cosine and two
 draws. The `uint8_t` fill writes one byte per draw and the 2^26 case runs 15% below 2^28.
 
 Timing every fill alone with its own fence lowers the 2^26 figures by up to 3.2% and the 2^28
@@ -229,7 +232,7 @@ to `KOKKOS_INLINE_FUNCTION` when Kokkos is included first, to `__host__ __device
 nvcc or hipcc, and to `inline` otherwise. It holds `T`, `F`, `F_keyed`, `block`, the stream
 position arithmetic, the float mappings including `to_f16_bits`, `Rng` on the `Draws<D>` base
 that device generators share, `GenState`, the bounded-fill helpers `below_u32` and `below_u64`
-with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, `box_muller` and `box_muller_f32`, and `Row`, the
+with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, `box_muller2` and `box_muller2_f32`, and `Row`, the
 eight lanes of a group. HIP and
 SYCL ports can reuse it and add only their fill kernels.
 
