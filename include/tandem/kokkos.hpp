@@ -25,17 +25,21 @@ namespace tandem {
 namespace detail {
 
 struct f16_bits {}; /* binary16 bit patterns of the Float16 draws, stored as uint16_t */
+struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW32 */
+struct below64 {};
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
- * the fill's key and chunk length. */
+ * what the bounded kinds need: the fill's key and chunk length, and the range. */
 struct Span {
     uint64_t p0, p1, r0, r1, g0, g1;
     uint32_t K;
     Key key;
+    uint64_t range;
 };
 
 /* How an output element is made from a block: element k of the block takes bits
- * [k bits, (k + 1) bits). `e` is its index in the fill. */
+ * [k bits, (k + 1) bits). `e` is its index in the fill, which the bounded kinds need for their
+ * fallback stream. */
 template <class Kind> struct elem;
 
 template <> struct elem<bool> {
@@ -102,6 +106,23 @@ template <> struct elem<double> {
         return to_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32));
     }
 };
+template <> struct elem<below32> {
+    using out_t = uint32_t;
+    static constexpr unsigned bits = 32;
+    KOKKOS_INLINE_FUNCTION static uint32_t make(const uint32_t w[4], unsigned k, uint64_t e,
+                                                const Span &s) {
+        return below_u32(w[k], (uint32_t)s.range, s.key.w, s.K, e);
+    }
+};
+template <> struct elem<below64> {
+    using out_t = uint64_t;
+    static constexpr unsigned bits = 64;
+    KOKKOS_INLINE_FUNCTION static uint64_t make(const uint32_t w[4], unsigned k, uint64_t e,
+                                                const Span &s) {
+        return below_u64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.range, s.key.w, s.K, e);
+    }
+};
+
 /* Store the elements of the block at stream bit P that fall inside the fill's bits [p0, p1).
  * With ALIGNED the output's blocks sit at 16-byte addresses, and a block fully inside is one
  * 16-byte store. */
@@ -291,6 +312,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.key = rng.key();
     s.p0 = p0;
     s.p1 = p0 + n * bits;
+    s.range = 0;
     rng.set_position(s.p1);
     return n != 0;
 }
@@ -305,11 +327,12 @@ inline void set_rows(Span &s, uint64_t ba, uint64_t bb) {
 
 template <class Exec, class Kind>
 void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rng &rng,
-               Kernel kernel) {
+               Kernel kernel, uint64_t range = 0) {
     constexpr unsigned bits = elem<Kind>::bits;
     Span s;
     if (!plan_span(rng, n, bits, bits, s))
         return;
+    s.range = range;
     set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
     /* Blocks land on 16-byte addresses when the output's first byte and the fill's first
      * stream byte agree modulo 16. */
@@ -317,6 +340,79 @@ void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rn
         fill_with<Kind, true>(exec, s, out, kernel);
     else
         fill_with<Kind, false>(exec, s, out, kernel);
+}
+
+/* Normal fill by Box-Muller, element i from the L = 2 (float) or 4 (double) 32-bit stream
+ * slots that start at slot S + i L, S being the first slot of the fill. A work item owns the
+ * blocks that hold the last slot of an element. With S % L != 0 an element can start in the
+ * previous block, so the item also steps the chunk of that block, which for lane 0 is lane 7
+ * one step back, or at step 0 the previous group's last chunk. */
+template <class O, bool STRADDLE, class Exec>
+void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb, O *out) {
+    constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
+    const uint64_t S = s.p0 >> 5, n = (s.p1 - s.p0) / (32u * L);
+    Kokkos::parallel_for(
+        "tandem::fill_normal",
+        Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, 0,
+                                                              (int64_t)(8u * (s.g1 - s.g0 + 1u))),
+        KOKKOS_LAMBDA(int64_t t) {
+            O *const dst = out; /* nvcc cannot first-capture `out` inside a constexpr if */
+            uint64_t c = 8u * s.g0 + (uint64_t)t, g = c >> 3, lane = c & 7u, row = g * s.K;
+            uint32_t o[4], h[4], po[4] = {0, 0, 0, 0}, ph[4] = {0, 0, 0, 0};
+            F_keyed(s.key.w, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+            if (STRADDLE)
+                F_keyed(s.key.w, lane ? c - 1u : 8u * g + 7u, DOMAIN_STREAM, AUX_STREAM, po, ph);
+            uint32_t j0 = row < s.r0 ? (uint32_t)(s.r0 - row) : 0u;
+            uint32_t j1 = (uint32_t)(s.r1 - row < s.K - 1u ? s.r1 - row : s.K - 1u);
+            for (uint32_t j = 0; j <= j1; j++) {
+                T(o, h);
+                if (STRADDLE && (lane || j))
+                    T(po, ph);
+                uint64_t b = (row + j) * 8u + lane;
+                if (j < j0 || b < ba || b > bb)
+                    continue;
+                uint32_t x[8] = {0, 0, 0, 0, o[0], o[1], o[2], o[3]};
+                if (STRADDLE) {
+                    uint32_t q[4] = {0, 0, 0, 0};
+                    const uint32_t *prev = po;
+                    if (lane == 0 && j == 0) {
+                        if (g > 0)
+                            block(s.key.w, 8u * (g - 1u) + 7u, s.K - 1u, q);
+                        prev = q;
+                    }
+                    for (unsigned k = 0; k < 4; k++)
+                        x[k] = prev[k];
+                }
+                for (unsigned m = 0; m < 4; m++) {
+                    uint64_t last = 4u * b + m + 1u; /* one past the element's last slot */
+                    if (last < S + L || (last - S) % L)
+                        continue;
+                    uint64_t i = (last - S) / L - 1u;
+                    if (i >= n)
+                        continue;
+                    const uint32_t *v = x + (m + 5u - L);
+                    if constexpr (L == 4)
+                        dst[i] = box_muller(to_f64(v[0] | ((uint64_t)v[1] << 32)),
+                                            to_f64(v[2] | ((uint64_t)v[3] << 32)));
+                    else
+                        dst[i] = box_muller_f32(to_f32(v[0]), to_f32(v[1]));
+                }
+            }
+        });
+}
+
+template <class Exec, class O>
+void fill_normal_ptr(const Exec &exec, O *out, uint64_t n, Rng &rng) {
+    constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
+    Span s;
+    if (!plan_span(rng, n, 32u * L / 2u, 32u * L, s))
+        return;
+    uint64_t S = s.p0 >> 5, ba = (S + L - 1u) >> 2, bb = (S + n * L - 1u) >> 2;
+    set_rows(s, ba, bb);
+    if (S % L)
+        fill_normal_chunk<O, true>(exec, s, ba, bb, out);
+    else
+        fill_normal_chunk<O, false>(exec, s, ba, bb, out);
 }
 
 /* What a View's value type draws: the kind of fill, and how many of its elements one value
@@ -416,6 +512,49 @@ template <class View> void fill_f16_bits(const View &view, Rng &rng) {
     typename View::execution_space exec;
     fill_f16_bits(exec, view, rng);
     exec.fence("tandem::fill_f16_bits: fence after the fill");
+}
+
+/* Uniform integers on [0, range) in a uint32_t or uint64_t View, by Lemire's method as
+ * Rng::urand(range). Element i takes draw i of the u32 (u64) fill and consumes exactly that one
+ * draw, so the fill advances the position by 32 n (64 n) bits whatever the draws are. A rejected
+ * draw retries on a fallback stream, see PURPOSE_BELOW32 in core.hpp. Not part of the
+ * specification. */
+template <class Exec, class View>
+void fill_below(const Exec &exec, const View &view, Rng &rng,
+                typename View::non_const_value_type range) {
+    using E = typename View::non_const_value_type;
+    static_assert(std::is_unsigned_v<E> && !std::is_same_v<E, bool> &&
+                      (sizeof(E) == 4 || sizeof(E) == 8),
+                  "tandem::fill_below: the value type must be uint32_t or uint64_t");
+    detail::check_view<Exec>(view, "tandem::fill_below");
+    using Kind = std::conditional_t<sizeof(E) == 4, detail::below32, detail::below64>;
+    detail::fill_kind<Exec, Kind>(exec, reinterpret_cast<typename detail::elem<Kind>::out_t *>(
+                                            view.data()),
+                                  view.size(), rng, detail::Kernel::Auto, range);
+}
+template <class View>
+void fill_below(const View &view, Rng &rng, typename View::non_const_value_type range) {
+    typename View::execution_space exec;
+    fill_below(exec, view, rng, range);
+    exec.fence("tandem::fill_below: fence after the fill");
+}
+
+/* Standard normals in a float or double View by Box-Muller, as Rng::normalf and Rng::normal:
+ * element i is made from the draws 2i and 2i + 1 of the f32 fill (float, 64 n bits in all) or
+ * the f64 fill (double, 128 n bits). Device log and cos differ from the host's in the last
+ * bits, so normals agree across backends to a few ulps, not bit for bit. Not part of the
+ * specification. */
+template <class Exec, class View> void fill_normal(const Exec &exec, const View &view, Rng &rng) {
+    using E = typename View::non_const_value_type;
+    static_assert(std::is_same_v<E, float> || std::is_same_v<E, double>,
+                  "tandem::fill_normal: the value type must be float or double");
+    detail::check_view<Exec>(view, "tandem::fill_normal");
+    detail::fill_normal_ptr(exec, view.data(), view.size(), rng);
+}
+template <class View> void fill_normal(const View &view, Rng &rng) {
+    typename View::execution_space exec;
+    fill_normal(exec, view, rng);
+    exec.fence("tandem::fill_normal: fence after the fill");
 }
 
 } // namespace tandem

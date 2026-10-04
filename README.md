@@ -16,6 +16,16 @@ bit, on every Kokkos backend.
   stream. The first form does not fence, the second fences.
 - `tandem::fill_f16_bits(view, rng)`: the binary16 bit patterns of the Float16 draws in a
   `uint16_t` View. A `uint16_t` View in `fill` gets raw 16-bit draws.
+- `tandem::fill_below(view, rng, range)`: uniform integers on `[0, range)` in a `uint32_t` or
+  `uint64_t` View, by Lemire's method as `Rng::urand(range)`. Element `i` takes draw `i` of the
+  u32 (u64) fill and consumes exactly that draw, so the fill advances the position by 32 n
+  (64 n) bits whatever the draws are. A rejected draw retries on a fallback stream, `split(i)`
+  of `sub(PURPOSE_BELOW32)` (or `64`), so a fill without rejections equals the sequential
+  `urand(range)` calls and the rare rejection costs no coordination.
+- `tandem::fill_normal(view, rng)`: standard normals in a `float` or `double` View by
+  Box-Muller, as `Rng::normalf` and `Rng::normal`. A `float` element takes two Float32 draws
+  (64 bits), a `double` element two Float64 draws (128 bits), element `i` from draws `2i` and
+  `2i + 1`. Both fills have `exec` forms like `fill`.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
@@ -36,6 +46,11 @@ double u = rng.drand();                    // continues the stream after the fil
 
 Kokkos::View<Kokkos::complex<float> **, Kokkos::LayoutLeft> z("z", 64, 64);
 tandem::fill(z, rng);                      // real then imaginary part per value, in memory order
+
+Kokkos::View<uint32_t *> die("die", n);
+tandem::fill_below(die, rng, 6u);          // uniform on [0, 6)
+Kokkos::View<float *> g("g", n);
+tandem::fill_normal(g, rng);               // standard normals
 
 Kokkos::View<float *> y("y", m);
 Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
@@ -62,7 +77,10 @@ writes Float32 draws. A View that is not contiguous, such as a column of a `Layo
 throws `std::invalid_argument`.
 
 Bounded and normal draws are not part of the specification, so other ports may produce other
-values for them. The method names and the `MAX_*` constants follow the Kokkos generators, so
+values for them. The bounded and normal fills follow the contract in `core.hpp` and the same
+fills in tandem-cuda. Device `log` and `cos` differ from the host's in the last bits, so a
+normal fill agrees across backends to a few ulps, not bit for bit. Host backends write the
+values of the scalar `normal()` and `normalf()` exactly. The method names and the `MAX_*` constants follow the Kokkos generators, so
 `Kokkos::rand<tandem::Rng, T>::draw(rng, ...)` works.
 
 ### No `Kokkos::fill_random` pool
@@ -127,11 +145,15 @@ pixi run -e cuda test-cuda
 
 `tests/test_tandem.cpp` runs every check on each enabled backend: Serial, OpenMP and CUDA. It
 checks every vector of the specification, compares fills of every type with every kernel and
-in-kernel scalar draws against reference stream dumps in `tests/data` (from tandem-cuda), compares
+in-kernel scalar draws against reference stream dumps in `tests/data` (from tandem-c), compares
 fills against in-kernel draws at random keys, chunk lengths, positions, lengths and output
 alignments, checks that fills split at arbitrary points with host draws between them continue
 one stream, checks mixed-width draws, random access, derived keys and fork positions, and checks
-the bounded and normal draws. It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
+the bounded and normal draws. Bounded fills are checked against the contract in `core.hpp`
+written out on host generators, against the sequential `urand(range)` calls, and against
+fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
+scalar draws from random positions, odd and even, and against fixtures from tandem-cuda
+(`tests/cross_normal.h`, 8 ulps plus 1e-6 for float, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`, and CI fails when it is out of date. CI runs the tests on Linux (GCC)
@@ -183,7 +205,10 @@ kernel runs within 1% of tandem-cuda's direct kernel (1309 to 1324 GiB/s).
 nothing but the C++ standard library. `TANDEM_FN` expands
 to `KOKKOS_INLINE_FUNCTION` when Kokkos is included first, to `__host__ __device__ inline` under
 nvcc or hipcc, and to `inline` otherwise. It holds `T`, `F`, `F_keyed`, `block`, the stream
-position arithmetic, the float mappings, `Rng`, and `Row`, the eight lanes of a group. HIP and
+position arithmetic, the float mappings including `to_f16_bits`, `Rng` on the `Draws<D>` base
+that device generators share, `GenState`, the bounded-fill helpers `below_u32` and `below_u64`
+with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, `box_muller` and `box_muller_f32`, and `Row`, the
+eight lanes of a group. HIP and
 SYCL ports can reuse it and add only their fill kernels.
 
 ## AI assistance

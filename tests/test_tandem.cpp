@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+
 #include <random>
 #include <string>
 #include <vector>
@@ -10,6 +11,8 @@
 #include <Kokkos_Random.hpp>
 #include <tandem/kokkos.hpp>
 
+#include "../external/tandem-cuda/tests/cross_fill_below.h"
+#include "cross_normal.h"
 #include "vectors.hpp"
 
 using tandem::Key;
@@ -478,6 +481,197 @@ template <class Exec> static void test_bounded() {
     CHECK(KU64::draw(a) == b.urand64());
 }
 
+// ---- Bounded and normal fills --------------------------------------------------------------
+
+// The contract in core.hpp, written out on host generators: element e takes draw e of the
+// fill, and a rejected draw retries on the draws of split(e) of sub(PURPOSE_BELOW) of the
+// fill's generator at position 0.
+static uint32_t ref_below32(const Key &key, uint32_t K, uint32_t u, uint32_t range, uint64_t e) {
+    uint64_t m = (uint64_t)u * range;
+    if ((uint32_t)m < range) {
+        uint32_t t = (0u - range) % range;
+        if ((uint32_t)m < t) {
+            Rng f = Rng::from_key(key, 0, K).sub(tandem::PURPOSE_BELOW32).split(e);
+            do
+                m = (uint64_t)f.urand() * range;
+            while ((uint32_t)m < t);
+        }
+    }
+    return (uint32_t)(m >> 32);
+}
+
+static uint64_t ref_below64(const Key &key, uint32_t K, uint64_t x, uint64_t range, uint64_t e) {
+    unsigned __int128 m = (unsigned __int128)x * range;
+    if ((uint64_t)m < range) {
+        uint64_t t = (0u - range) % range;
+        if ((uint64_t)m < t) {
+            Rng f = Rng::from_key(key, 0, K).sub(tandem::PURPOSE_BELOW64).split(e);
+            do
+                m = (unsigned __int128)f.urand64() * range;
+            while ((uint64_t)m < t);
+        }
+    }
+    return (uint64_t)(m >> 64);
+}
+
+template <class E> static E ref_below(const Key &key, uint32_t K, E draw, E range, uint64_t e) {
+    if constexpr (sizeof(E) == 4)
+        return ref_below32(key, K, draw, range, e);
+    else
+        return ref_below64(key, K, draw, range, e);
+}
+
+// Host copy of a bounded fill of n elements on Exec with an explicit kernel.
+template <class Exec, class E>
+static std::vector<E> device_below(const Key &key, uint64_t pos, uint32_t K, size_t n, E range,
+                                   Kernel kernel, size_t shift, uint64_t *end) {
+    using Kind = std::conditional_t<sizeof(E) == 4, tandem::detail::below32,
+                                    tandem::detail::below64>;
+    Kokkos::View<E *, typename Exec::memory_space> buf("below", n + 4);
+    auto out = Kokkos::subview(buf, Kokkos::pair<size_t, size_t>(shift, shift + n));
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill_kind<Exec, Kind>(Exec(), out.data(), n, r, kernel, range);
+    Exec().fence();
+    *end = r.position();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    return std::vector<E>(host.data(), host.data() + n);
+}
+
+// Ranges 0 and 1, small ranges, 2^31 + 1 and the maximum, which reject often.
+template <class Exec, class E> static void check_below(const char *label) {
+    const E ranges[] = {0, 1, 3, 1000, (E)1 << (8 * sizeof(E) - 1) | 1u, (E) ~(E)0};
+    for (const Trial &t : trials(41, 12)) {
+        for (E range : ranges) {
+            uint64_t p0 = tandem::align_pos(t.pos, 8 * sizeof(E));
+            auto draws = device_fill<Exec, E>(t.key, t.pos, t.K, t.n, kernels<Exec>()[0]);
+            std::vector<E> want(t.n);
+            for (size_t i = 0; i < t.n; i++)
+                want[i] = ref_below<E>(t.key, t.K, draws[i], range, i);
+            for (Kernel kernel : kernels<Exec>()) {
+                uint64_t end;
+                auto got = device_below<Exec, E>(t.key, t.pos, t.K, t.n, range, kernel, t.shift,
+                                                 &end);
+                CHECK(first_diff(want, got) == SIZE_MAX);
+                CHECK(end == p0 + t.n * 8 * sizeof(E));
+                if (first_diff(want, got) != SIZE_MAX)
+                    std::printf("  %s %s below(%llu) (K=%u pos=%llu n=%zu shift=%zu) at %zu\n",
+                                label, name(kernel), (unsigned long long)range, t.K,
+                                (unsigned long long)t.pos, t.n, t.shift, first_diff(want, got));
+            }
+        }
+    }
+}
+
+// Without a rejection a bounded fill equals the sequential urand(range) calls, and fixtures from
+// tandem-cuda pin the fallback stream: 41 of the 2^31 + 1 elements and 34 of the 2^63 + 1
+// elements reject.
+template <class Exec> static void test_below() {
+    check_below<Exec, uint32_t>("u32");
+    check_below<Exec, uint64_t>("u64");
+
+    const Key key = Rng(11).key();
+    uint64_t end0;
+    auto got = device_below<Exec, uint32_t>(key, 5, 32, 5000, 1000u, kernels<Exec>()[0], 0,
+                                            &end0);
+    Rng r = Rng::from_key(key, 5, 32);
+    bool same = true;
+    for (uint32_t v : got)
+        same = same && v == r.urand(1000u);
+    CHECK(same);
+
+    CHECK(words_equal(CROSS_FILL_KEY, Rng(42).key().w));
+    const Key k42 = Rng(42).key();
+    for (Kernel kernel : kernels<Exec>()) {
+        uint64_t end;
+        for (const auto &f : CROSS_BELOW32) {
+            auto v = device_below<Exec, uint32_t>(k42, 0, 32, 64, f.range, kernel, 0, &end);
+            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 && end == 64 * 32);
+        }
+        for (const auto &f : CROSS_BELOW64) {
+            auto v = device_below<Exec, uint64_t>(k42, 0, 32, 64, f.range, kernel, 0, &end);
+            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 && end == 64 * 64);
+        }
+    }
+}
+
+// Normals agree across libms to a few ulps. Host spaces share the host's libm.
+template <class E> static bool near_normal(E got, E want) {
+    if constexpr (std::is_same_v<E, double>)
+        return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-15;
+    else
+        return std::abs(got - want) <= 8.0f * 0x1p-23f * std::abs(want) + 1e-6f;
+}
+
+template <class Exec, class E>
+static std::vector<E> device_normal(const Key &key, uint64_t pos, uint32_t K, size_t n,
+                                    size_t shift, uint64_t *end) {
+    Kokkos::View<E *, typename Exec::memory_space> buf("normal", n + 4);
+    auto out = Kokkos::subview(buf, Kokkos::pair<size_t, size_t>(shift, shift + n));
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::fill_normal(Exec(), out, r);
+    Exec().fence();
+    *end = r.position();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    return std::vector<E>(host.data(), host.data() + n);
+}
+
+template <class E> static E next_normal(Rng &r) {
+    if constexpr (std::is_same_v<E, double>)
+        return r.normal();
+    else
+        return r.normalf();
+}
+
+template <class Exec, class E> static void check_normal(const char *label) {
+    constexpr bool host = tandem::detail::is_host<Exec>;
+    for (const Trial &t : trials(42, 24)) {
+        Rng r = Rng::from_key(t.key, t.pos, t.K);
+        std::vector<E> want(t.n);
+        for (E &z : want)
+            z = next_normal<E>(r);
+        uint64_t end;
+        auto got = device_normal<Exec, E>(t.key, t.pos, t.K, t.n, t.shift, &end);
+        bool ok = true;
+        for (size_t i = 0; i < t.n; i++)
+            ok = ok && (host ? got[i] == want[i] : near_normal(got[i], want[i]));
+        CHECK(ok);
+        CHECK(end == r.position());
+        if (!ok)
+            std::printf("  %s normal (K=%u pos=%llu n=%zu shift=%zu)\n", label, t.K,
+                        (unsigned long long)t.pos, t.n, t.shift);
+    }
+}
+
+// Fixtures made by tandem-cuda's core.hpp and checked by tandem-c: after one Bool draw the
+// fill starts at bit 64, an even Float64 draw, and at bit 32, an odd Float32 draw.
+template <class Exec> static void test_normal() {
+    check_normal<Exec, double>("f64");
+    check_normal<Exec, float>("f32");
+
+    const Key k42 = Rng(42).key();
+    Rng r = Rng::from_key(k42, 1, 32);
+    Kokkos::View<double *, typename Exec::memory_space> d("d", CROSS_NORMAL_COUNT);
+    tandem::fill_normal(Exec(), d, r);
+    Exec().fence();
+    CHECK(r.position() == CROSS_NORMAL_END_POS);
+    auto hd = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
+    bool ok = true;
+    for (int i = 0; i < CROSS_NORMAL_COUNT; i++)
+        ok = ok && near_normal(hd(i), CROSS_NORMAL[i]);
+    CHECK(ok);
+
+    r = Rng::from_key(k42, 1, 32);
+    Kokkos::View<float *, typename Exec::memory_space> f("f", CROSS_NORMAL_COUNT);
+    tandem::fill_normal(Exec(), f, r);
+    Exec().fence();
+    CHECK(r.position() == CROSS_NORMALF_END_POS);
+    auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), f);
+    ok = true;
+    for (int i = 0; i < CROSS_NORMAL_COUNT; i++)
+        ok = ok && near_normal(hf(i), CROSS_NORMALF[i]);
+    CHECK(ok);
+}
+
 // ---- Value types ---------------------------------------------------------------------------
 
 // Fills of narrow and signed integers take the bits of the u32 stream at their own alignment.
@@ -617,6 +811,8 @@ template <class Exec> static void run(const char *space, const std::string &dir)
     check_complex<Exec, float>();
     check_complex<Exec, double>();
     test_ranks<Exec>();
+    test_below<Exec>();
+    test_normal<Exec>();
     std::printf("%s: %ld checks, %ld failures\n", space, checks - c0, failures - f0);
 }
 
@@ -630,6 +826,28 @@ template <class Exec, class E> static void same_as_serial(const char *space) {
             if (std::memcmp(want.data(), got.data(), t.n * sizeof(E)) != 0)
                 std::printf("  %s %s differs from Serial\n", space, name(kernel));
         }
+    }
+}
+
+// Bounded fills are integers and equal Serial's bytes. Normals equal them on host spaces and
+// agree to a few ulps on devices.
+template <class Exec> static void same_as_serial_below_normal(const char *space) {
+    constexpr bool host = tandem::detail::is_host<Exec>;
+    for (const Trial &t : trials(78, 12)) {
+        uint64_t e1, e2;
+        auto w32 = device_below<Kokkos::Serial, uint32_t>(t.key, t.pos, t.K, t.n, 6000001u,
+                                                          Kernel::Group, 0, &e1);
+        auto g32 = device_below<Exec, uint32_t>(t.key, t.pos, t.K, t.n, 6000001u,
+                                                kernels<Exec>()[0], t.shift, &e2);
+        CHECK(w32 == g32 && e1 == e2);
+        auto wn = device_normal<Kokkos::Serial, double>(t.key, t.pos, t.K, t.n, 0, &e1);
+        auto gn = device_normal<Exec, double>(t.key, t.pos, t.K, t.n, t.shift, &e2);
+        bool ok = e1 == e2;
+        for (size_t i = 0; i < t.n; i++)
+            ok = ok && (host ? wn[i] == gn[i] : near_normal(gn[i], wn[i]));
+        CHECK(ok);
+        if (!ok)
+            std::printf("  %s normal differs from Serial\n", space);
     }
 }
 
@@ -647,6 +865,7 @@ template <class Exec> static void compare_with_serial(const char *space) {
 #if !KOKKOS_HALF_T_IS_FLOAT
     same_as_serial<Exec, Kokkos::Experimental::half_t>(space);
 #endif
+    same_as_serial_below_normal<Exec>(space);
     std::printf("%s vs Serial: %ld checks\n", space, checks - c0);
 }
 
