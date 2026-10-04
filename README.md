@@ -19,9 +19,11 @@ bit, on every Kokkos backend.
 - `tandem::fill_below(view, rng, range)`: uniform integers on `[0, range)` in a `uint32_t` or
   `uint64_t` View, by Lemire's method as `Rng::urand(range)`. Element `i` takes draw `i` of the
   u32 (u64) fill and consumes exactly that draw, so the fill advances the position by 32 n
-  (64 n) bits whatever the draws are. A rejected draw retries on a fallback stream, `split(i)`
-  of `sub(PURPOSE_BELOW32)` (or `64`), so a fill without rejections equals the sequential
-  `urand(range)` calls and the rare rejection costs no coordination.
+  (64 n) bits whatever the draws are. A rejected draw retries on a fallback stream, `split(g)`
+  of `sub(PURPOSE_BELOW32)` (or `64`), keyed by the global draw index `g`, the aligned start
+  position over the width plus `i`. A fill without rejections equals the sequential
+  `urand(range)` calls, a fill cut at any element equals the whole fill, and the rare rejection
+  costs no coordination.
 - `tandem::fill_normal(view, rng)`: standard normals in a `float` or `double` View by
   Box-Muller, the flattened sequence of `Rng::normalf2` or `Rng::normal2` calls. Pair `j`, the
   elements `2j` and `2j + 1` with the cos half first, comes from the draws `2j` and `2j + 1` of
@@ -167,7 +169,7 @@ fills against in-kernel draws at random keys, chunk lengths, positions, lengths 
 alignments, checks that fills split at arbitrary points with host draws between them continue
 one stream, checks mixed-width draws, random access, derived keys and fork positions, and checks
 the bounded and normal draws. Bounded fills are checked against the contract in `core.hpp`
-written out on host generators, against the sequential `urand(range)` calls, and against
+written out on host generators, against the sequential `urand(range)` calls, against a fill cut in two, and against
 fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
 scalar `normal2()` calls from random positions and counts, odd and even, and against fixtures from tandem-cuda
 (`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: 16 ulps plus 1e-6 for float on CUDA, 8 ulps on host spaces, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex

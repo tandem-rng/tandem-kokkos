@@ -486,9 +486,10 @@ template <class Exec> static void test_bounded() {
 
 // ---- Bounded and normal fills --------------------------------------------------------------
 
-// The contract in core.hpp, written out on host generators: element e takes draw e of the
-// fill, and a rejected draw retries on the draws of split(e) of sub(PURPOSE_BELOW) of the
-// fill's generator at position 0.
+// The contract in core.hpp, written out on host generators: element i takes the draw at its own
+// index, and a rejected draw retries on the draws of split(g) of sub(PURPOSE_BELOW) of the
+// fill's generator at position 0, g being the global draw index: the aligned start position over
+// the width plus i.
 static uint32_t ref_below32(const Key &key, uint32_t K, uint32_t u, uint32_t range, uint64_t e) {
     uint64_t m = (uint64_t)u * range;
     if ((uint32_t)m < range) {
@@ -549,7 +550,7 @@ template <class Exec, class E> static void check_below(const char *label) {
             auto draws = device_fill<Exec, E>(t.key, t.pos, t.K, t.n, kernels<Exec>()[0]);
             std::vector<E> want(t.n);
             for (size_t i = 0; i < t.n; i++)
-                want[i] = ref_below<E>(t.key, t.K, draws[i], range, i);
+                want[i] = ref_below<E>(t.key, t.K, draws[i], range, p0 / (8 * sizeof(E)) + i);
             for (Kernel kernel : kernels<Exec>()) {
                 uint64_t end;
                 auto got = device_below<Exec, E>(t.key, t.pos, t.K, t.n, range, kernel, t.shift,
@@ -565,12 +566,35 @@ template <class Exec, class E> static void check_below(const char *label) {
     }
 }
 
+// A fill cut at an arbitrary element boundary equals the whole fill, at a start with
+// rejections: the range 2^31 + 1 rejects about half of the u32 draws.
+template <class Exec, class E> static void check_below_cut() {
+    const Key key = Rng(13).key();
+    constexpr size_t n = 3001;
+    const E range = (E)1 << (8 * sizeof(E) - 1) | 1u;
+    Kokkos::View<E *, typename Exec::memory_space> whole("whole", n), a("a", 1234), b("b", n - 1234);
+    Rng r = Rng::from_key(key, 77, 32), w = r;
+    tandem::fill_below(Exec(), whole, w, range);
+    tandem::fill_below(Exec(), a, r, range);
+    tandem::fill_below(Exec(), b, r, range);
+    Exec().fence();
+    auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), whole);
+    auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+    auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), b);
+    bool same = r.position() == w.position();
+    for (size_t i = 0; i < n; i++)
+        same = same && hw(i) == (i < 1234 ? ha(i) : hb(i - 1234));
+    CHECK(same);
+}
+
 // Without a rejection a bounded fill equals the sequential urand(range) calls, and fixtures from
 // tandem-cuda pin the fallback stream: 41 of the 2^31 + 1 elements and 34 of the 2^63 + 1
 // elements reject.
 template <class Exec> static void test_below() {
     check_below<Exec, uint32_t>("u32");
     check_below<Exec, uint64_t>("u64");
+    check_below_cut<Exec, uint32_t>();
+    check_below_cut<Exec, uint64_t>();
 
     const Key key = Rng(11).key();
     uint64_t end0;

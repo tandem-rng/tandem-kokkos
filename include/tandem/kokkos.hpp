@@ -111,7 +111,7 @@ template <> struct elem<below32> {
     static constexpr unsigned bits = 32;
     KOKKOS_INLINE_FUNCTION static uint32_t make(const uint32_t w[4], unsigned k, uint64_t e,
                                                 const Span &s) {
-        return below_u32(w[k], (uint32_t)s.range, s.key.w, s.K, e);
+        return below_u32(w[k], (uint32_t)s.range, s.key.w, s.K, (s.p0 >> 5) + e);
     }
 };
 template <> struct elem<below64> {
@@ -119,7 +119,8 @@ template <> struct elem<below64> {
     static constexpr unsigned bits = 64;
     KOKKOS_INLINE_FUNCTION static uint64_t make(const uint32_t w[4], unsigned k, uint64_t e,
                                                 const Span &s) {
-        return below_u64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.range, s.key.w, s.K, e);
+        return below_u64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.range, s.key.w, s.K,
+                        (s.p0 >> 6) + e);
     }
 };
 
