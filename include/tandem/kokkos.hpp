@@ -495,6 +495,11 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
         });
 }
 
+/* GCC 14 with -mfma reports w as maybe uninitialized, although it is zeroed at its definition. */
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 /* Normal fill on host spaces: a work item steps the eight chunks of a group together and turns
  * the pairs that end in each row into normals with one normal_block call, which the compiler
  * vectorizes. The stream slots of a row are its 32 words, and the pairs are the L-word windows
@@ -556,6 +561,9 @@ template <class O, class Exec> void fill_normal_group(const Exec &exec, const Sp
             }
         });
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 template <class Exec, class O>
 void fill_normal_ptr(const Exec &exec, O *out, uint64_t n, Rng &rng) {
