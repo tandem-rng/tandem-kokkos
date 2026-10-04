@@ -1,4 +1,5 @@
 # Recipe for a Spack package repository. It is not submitted to spack-packages yet.
+from spack_repo.builtin.build_systems import cmake
 from spack_repo.builtin.build_systems.cmake import CMakePackage
 
 from spack.package import *
@@ -38,9 +39,22 @@ class TandemKokkos(CMakePackage):
     for _arch in ("70", "75", "80", "86", "89", "90"):
         depends_on(f"kokkos cuda_arch={_arch}", when=f"+cuda cuda_arch={_arch}")
 
-    def cmake_args(self):
-        return [self.define("TANDEM_TESTS", self.run_tests), self.define("TANDEM_BENCH", False)]
-
     def setup_build_environment(self, env):
         if self.spec.satisfies("+cuda"):
             env.set("NVCC_WRAPPER_DEFAULT_COMPILER", self.compiler.cxx)
+
+
+class CMakeBuilder(cmake.CMakeBuilder):
+    def cmake_args(self):
+        return [
+            self.define("TANDEM_TESTS", self.pkg.run_tests),
+            self.define("TANDEM_BENCH", False),
+        ]
+
+    def check(self):
+        # A CUDA build needs a GPU, which a build host often lacks.
+        if self.spec.satisfies("+cuda"):
+            return
+        with working_dir(self.build_directory):
+            ctest = Executable(self.spec["cmake"].prefix.bin.ctest)
+            ctest("--output-on-failure", env={"OMP_PROC_BIND": "false"})
