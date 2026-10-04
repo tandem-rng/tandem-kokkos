@@ -513,7 +513,7 @@ template <class O, class Exec> void fill_normal_group(const Exec &exec, const Sp
         "tandem::fill_normal (group)",
         Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, (int64_t)s.g0,
                                                               (int64_t)s.g1 + 1),
-        KOKKOS_LAMBDA(int64_t g) {
+        [=](int64_t g) { /* host only: normal_block_* are host functions */
             Row R;
             R.seed(s.key.w, (uint64_t)g);
             uint64_t row = (uint64_t)g * s.K;
