@@ -7,11 +7,15 @@ a noncryptographic pseudorandom number generator built to be fast on CPUs and GP
 headers, C++17, no compiled library. It produces the stream the specification defines, bit for
 bit, on every Kokkos backend.
 
-- `tandem::fill(exec, view, rng)` and `tandem::fill(view, rng)`: fill a contiguous rank-1
-  `Kokkos::View` of `uint32_t`, `uint64_t`, `float`, `double` or `bool` with the draws that start
-  at the generator's position, as the specification's fill defines, and move the position past
-  them. The host generator advances exactly as a CPU fill would, so CPU and GPU draws
-  interleave on one stream. The first form does not fence, the second fences.
+- `tandem::fill(exec, view, rng)` and `tandem::fill(view, rng)`: fill a contiguous
+  `Kokkos::View` of any rank and layout with the draws that start at the generator's position,
+  as the specification's fill defines, and move the position past them. The value type is
+  `bool`, an integer of 8 to 64 bits, `float`, `double`, `Kokkos::complex<float>`,
+  `Kokkos::complex<double>` or `Kokkos::Experimental::half_t`. The fill runs in memory order.
+  The host generator advances exactly as a CPU fill would, so CPU and GPU draws interleave on one
+  stream. The first form does not fence, the second fences.
+- `tandem::fill_f16_bits(view, rng)`: the binary16 bit patterns of the Float16 draws in a
+  `uint16_t` View. A `uint16_t` View in `fill` gets raw 16-bit draws.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
@@ -30,6 +34,9 @@ Kokkos::View<double *> x("x", n);
 tandem::fill(x, rng);                      // the spec's Float64 fill, on x's execution space
 double u = rng.drand();                    // continues the stream after the fill
 
+Kokkos::View<Kokkos::complex<float> **, Kokkos::LayoutLeft> z("z", 64, 64);
+tandem::fill(z, rng);                      // real then imaginary part per value, in memory order
+
 Kokkos::View<float *> y("y", m);
 Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
     tandem::Rng r = rng.split(i);          // one generator per work item, from the key alone
@@ -47,6 +54,12 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 | `normal()`, `normal(mean, sd)` | Box-Muller from two Float64 draws |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
+
+Signed integers hold the two's complement of the unsigned draw of the same width. A complex
+value takes two draws, the real and then the imaginary component. `half_t` needs a Kokkos with a
+half type, which the conda-forge build for macOS lacks: there `half_t` is `float` and `fill`
+writes Float32 draws. A View that is not contiguous, such as a column of a `LayoutRight` matrix,
+throws `std::invalid_argument`.
 
 Bounded and normal draws are not part of the specification, so other ports may produce other
 values for them. The method names and the `MAX_*` constants follow the Kokkos generators, so
@@ -114,11 +127,12 @@ pixi run -e cuda test-cuda
 
 `tests/test_tandem.cpp` runs every check on each enabled backend: Serial, OpenMP and CUDA. It
 checks every vector of the specification, compares fills of every type with every kernel and
-in-kernel scalar draws against reference stream dumps in `tests/data` (from tandem-c), compares
+in-kernel scalar draws against reference stream dumps in `tests/data` (from tandem-cuda), compares
 fills against in-kernel draws at random keys, chunk lengths, positions, lengths and output
 alignments, checks that fills split at arbitrary points with host draws between them continue
 one stream, checks mixed-width draws, random access, derived keys and fork positions, and checks
-the bounded and normal draws. Every non-Serial backend must then write the bytes Serial writes.
+the bounded and normal draws. It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
+fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`, and CI fails when it is out of date. CI runs the tests on Linux (GCC)
 and macOS (clang) with Serial and OpenMP, and once with `TANDEM_NO_SIMD`.

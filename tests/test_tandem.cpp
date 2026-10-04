@@ -80,6 +80,18 @@ static std::vector<host_t<E>> device_fill(const Key &key, uint64_t pos, uint32_t
     return std::vector<host_t<E>>(host.data(), host.data() + n);
 }
 
+// The same for Float16 bit patterns.
+template <class Exec>
+static std::vector<uint16_t> device_f16_bits(const Key &key, uint64_t pos, uint32_t K, size_t n,
+                                             Kernel kernel) {
+    Kokkos::View<uint16_t *, typename Exec::memory_space> out("f16", n);
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill_kind<Exec, tandem::detail::f16_bits>(Exec(), out.data(), n, r, kernel);
+    Exec().fence();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    return std::vector<uint16_t>(host.data(), host.data() + n);
+}
+
 // Host copy of n scalar draws on Exec, 256 consecutive draws per work item, each work item
 // with its own generator placed at its first element.
 template <class Exec, class E>
@@ -218,7 +230,8 @@ template <class T> static std::vector<T> slurp(const std::string &dir, const cha
 }
 
 template <class Exec, class E>
-static void check_dump(const std::string &dir, const char *file, const Key &key, uint32_t K) {
+static void check_dump_fill(const std::string &dir, const char *file, const Key &key,
+                            uint32_t K) {
     std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
     if (want.empty())
         return;
@@ -228,6 +241,14 @@ static void check_dump(const std::string &dir, const char *file, const Key &key,
         if (i != SIZE_MAX)
             std::printf("  %s: %s fill differs at %zu\n", file, name(kernel), i);
     }
+}
+
+template <class Exec, class E>
+static void check_dump(const std::string &dir, const char *file, const Key &key, uint32_t K) {
+    check_dump_fill<Exec, E>(dir, file, key, K);
+    std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
+    if (want.empty())
+        return;
     size_t i = first_diff(want, device_draws<Exec, E>(key, 0, K, want.size()));
     CHECK(i == SIZE_MAX);
     if (i != SIZE_MAX)
@@ -243,6 +264,14 @@ template <class Exec> static void test_dumps(const std::string &dir) {
     check_dump<Exec, double>(dir, "seed42_K32_f64.bin", s42, 32);
     check_dump<Exec, float>(dir, "seed42_K32_f32.bin", s42, 32);
     check_dump<Exec, bool>(dir, "seed42_K32_bool.bin", s42, 32);
+    check_dump_fill<Exec, uint8_t>(dir, "seed42_K32_u8.bin", s42, 32);
+    check_dump_fill<Exec, Kokkos::complex<float>>(dir, "seed42_K32_c32.bin", s42, 32);
+    check_dump_fill<Exec, Kokkos::complex<double>>(dir, "seed42_K32_c64.bin", s42, 32);
+
+    std::vector<uint16_t> f16 = slurp<uint16_t>(dir, "seed42_K32_f16bits.bin");
+    for (Kernel kernel : kernels<Exec>())
+        CHECK(first_diff(f16, device_f16_bits<Exec>(s42, 0, 32, f16.size(), kernel)) ==
+              SIZE_MAX);
 }
 
 // ---- Fills against draws at random keys, chunk lengths, positions, lengths, alignments ----
@@ -449,6 +478,121 @@ template <class Exec> static void test_bounded() {
     CHECK(KU64::draw(a) == b.urand64());
 }
 
+// ---- Value types ---------------------------------------------------------------------------
+
+// Fills of narrow and signed integers take the bits of the u32 stream at their own alignment.
+template <class Exec, class E> static void check_narrow(const char *label) {
+    for (const Trial &t : trials(31, 12)) {
+        constexpr unsigned w = bits_of<E>;
+        uint64_t p0 = tandem::align_pos(t.pos, w);
+        auto words = device_fill<Exec, uint32_t>(t.key, 0, t.K, (p0 + t.n * w) / 32 + 2,
+                                                 Kernel::Chunk);
+        std::vector<E> want(t.n);
+        for (size_t i = 0; i < t.n; i++)
+            want[i] = (E)bits_at(words, 0, p0 + i * w, w);
+        for (Kernel kernel : kernels<Exec>()) {
+            uint64_t end;
+            auto got = device_fill<Exec, E>(t.key, t.pos, t.K, t.n, kernel, t.shift, &end);
+            CHECK(first_diff(want, got) == SIZE_MAX);
+            CHECK(end == p0 + t.n * w);
+            if (first_diff(want, got) != SIZE_MAX)
+                std::printf("  %s %s fill (K=%u pos=%llu n=%zu shift=%zu)\n", label, name(kernel),
+                            t.K, (unsigned long long)t.pos, t.n, t.shift);
+        }
+    }
+}
+
+// A signed fill holds the two's complement of the unsigned fill of the same width.
+template <class Exec, class S, class U> static void check_signed() {
+    for (const Trial &t : trials(32, 6)) {
+        auto u = device_fill<Exec, U>(t.key, t.pos, t.K, t.n, kernels<Exec>()[0], t.shift);
+        auto s = device_fill<Exec, S>(t.key, t.pos, t.K, t.n, kernels<Exec>()[0], t.shift);
+        CHECK(std::memcmp(u.data(), s.data(), t.n * sizeof(S)) == 0);
+    }
+}
+
+// The binary16 bits decode to (raw >> 5) * 2^-11, checked by decoding the fields by hand, and
+// a half_t View holds the same bits where Kokkos has a half type, which it lacks on some hosts.
+template <class Exec> static void test_f16() {
+    for (const Trial &t : trials(33, 8)) {
+        auto raw = device_fill<Exec, uint16_t>(t.key, t.pos, t.K, t.n, kernels<Exec>()[0]);
+        for (Kernel kernel : kernels<Exec>()) {
+            auto bits = device_f16_bits<Exec>(t.key, t.pos, t.K, t.n, kernel);
+            bool ok = true;
+            for (size_t i = 0; i < t.n; i++) {
+                unsigned e = bits[i] >> 10 & 31u, m = bits[i] & 1023u;
+                double v = bits[i] == 0 ? 0.0 : std::ldexp(1.0 + m / 1024.0, (int)e - 15);
+                ok = ok && !(bits[i] >> 15) && e != 31 && v == (raw[i] >> 5) * 0x1p-11;
+            }
+            CHECK(ok);
+        }
+#if !KOKKOS_HALF_T_IS_FLOAT
+        Kokkos::View<Kokkos::Experimental::half_t *, typename Exec::memory_space> h("h", t.n);
+        Rng r = Rng::from_key(t.key, t.pos, t.K);
+        tandem::fill(Exec(), h, r);
+        Exec().fence();
+        CHECK(r.position() == tandem::align_pos(t.pos, 16) + t.n * 16);
+        auto hh = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), h);
+        auto bits = device_f16_bits<Exec>(t.key, t.pos, t.K, t.n, kernels<Exec>()[0]);
+        bool ok = true;
+        for (size_t i = 0; i < t.n; i++) {
+            uint16_t held;
+            std::memcpy(&held, &hh(i), 2);
+            ok = ok && (float)hh(i) == (float)(raw[i] >> 5) * 0x1p-11f && held == bits[i];
+        }
+        CHECK(ok);
+#endif
+    }
+}
+
+// A complex value takes two draws, the real and then the imaginary component.
+template <class Exec, class T> static void check_complex() {
+    for (const Trial &t : trials(34, 8)) {
+        auto parts = device_fill<Exec, T>(t.key, t.pos, t.K, 2 * t.n, kernels<Exec>()[0]);
+        for (Kernel kernel : kernels<Exec>()) {
+            uint64_t end;
+            auto c = device_fill<Exec, Kokkos::complex<T>>(t.key, t.pos, t.K, t.n, kernel,
+                                                           t.shift, &end);
+            CHECK(std::memcmp(c.data(), parts.data(), t.n * sizeof(Kokkos::complex<T>)) == 0);
+            CHECK(end == tandem::align_pos(t.pos, 8 * sizeof(T)) + 16 * sizeof(T) * t.n);
+        }
+    }
+}
+
+// Views of any rank and layout fill in memory order, and a strided View is refused.
+template <class Exec> static void test_ranks() {
+    const Key key = Rng(5).key();
+    constexpr size_t a = 7, b = 11, c = 13, n = a * b * c;
+    auto want = device_fill<Exec, double>(key, 3, 32, n, kernels<Exec>()[0]);
+    auto host_copy = [](auto v) {
+        auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
+        return std::vector<double>(h.data(), h.data() + h.span());
+    };
+    Kokkos::View<double ***, Kokkos::LayoutRight, typename Exec::memory_space> r3("r3", a, b, c);
+    Kokkos::View<double ***, Kokkos::LayoutLeft, typename Exec::memory_space> l3("l3", a, b, c);
+    Kokkos::View<double, Kokkos::LayoutRight, typename Exec::memory_space> r0("r0");
+    Rng g = Rng::from_key(key, 3, 32), h = g;
+    tandem::fill(Exec(), r3, g);
+    tandem::fill(Exec(), l3, h);
+    Exec().fence();
+    CHECK(first_diff(want, host_copy(r3)) == SIZE_MAX);
+    CHECK(first_diff(want, host_copy(l3)) == SIZE_MAX);
+    CHECK(g.position() == h.position() && g.position() == 64 + 64 * n);
+    tandem::fill(Exec(), r0, g);
+    Exec().fence();
+    CHECK(g.position() == 64 + 64 * (n + 1));
+
+    Kokkos::View<double **, Kokkos::LayoutRight, typename Exec::memory_space> m("m", 8, 8);
+    auto column = Kokkos::subview(m, Kokkos::ALL, 2);
+    bool threw = false;
+    try {
+        tandem::fill(Exec(), column, g);
+    } catch (const std::invalid_argument &) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 // ---- Backends -----------------------------------------------------------------------------
 
 template <class Exec> static void run(const char *space, const std::string &dir) {
@@ -463,6 +607,16 @@ template <class Exec> static void run(const char *space, const std::string &dir)
     test_split_fills<Exec>();
     test_mixed_draws<Exec>();
     test_bounded<Exec>();
+    check_narrow<Exec, uint8_t>("u8");
+    check_narrow<Exec, uint16_t>("u16");
+    check_signed<Exec, int8_t, uint8_t>();
+    check_signed<Exec, int16_t, uint16_t>();
+    check_signed<Exec, int32_t, uint32_t>();
+    check_signed<Exec, int64_t, uint64_t>();
+    test_f16<Exec>();
+    check_complex<Exec, float>();
+    check_complex<Exec, double>();
+    test_ranks<Exec>();
     std::printf("%s: %ld checks, %ld failures\n", space, checks - c0, failures - f0);
 }
 
@@ -486,6 +640,13 @@ template <class Exec> static void compare_with_serial(const char *space) {
     same_as_serial<Exec, float>(space);
     same_as_serial<Exec, double>(space);
     same_as_serial<Exec, bool>(space);
+    same_as_serial<Exec, uint8_t>(space);
+    same_as_serial<Exec, uint16_t>(space);
+    same_as_serial<Exec, int64_t>(space);
+    same_as_serial<Exec, Kokkos::complex<float>>(space);
+#if !KOKKOS_HALF_T_IS_FLOAT
+    same_as_serial<Exec, Kokkos::Experimental::half_t>(space);
+#endif
     std::printf("%s vs Serial: %ld checks\n", space, checks - c0);
 }
 
