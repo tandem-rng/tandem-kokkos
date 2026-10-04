@@ -94,6 +94,12 @@ depends on scheduling, so no pool adaptor can make that fill reproducible. `tand
 replaces it, and in your own kernels `rng.split(i)` keyed by the work item index gives every
 item its own stream.
 
+Parallel use: element `i` of a fill is draw `i`, so ranks, threads or devices that start at the
+position of their first element, or draw from `split(task)`, reproduce a serial run for any
+decomposition, as
+[Appendix B](https://github.com/tandem-rng/spec/blob/main/SPEC.md#appendix-b-parallel-decomposition-non-normative)
+of the specification shows.
+
 ## Kernels
 
 On host execution spaces a work item steps the eight chunks of a group together, a whole
