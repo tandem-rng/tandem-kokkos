@@ -16,6 +16,9 @@ using tandem::Key;
 using tandem::Rng;
 using tandem::detail::Kernel;
 
+// A kernel captures the generator by value, so its size is part of the contract.
+static_assert(sizeof(Rng) == 80, "Rng must stay 80 bytes");
+
 static long checks, failures;
 
 #define CHECK(cond)                                                                                \
