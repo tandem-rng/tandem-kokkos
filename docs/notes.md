@@ -77,6 +77,10 @@ Spack or conda-forge yet, and both build from the `main` branch.
   the Float32 (Float64) fill, one work item per pair. An odd count drops the last sin half and
   still consumes both draws, 64 (128) bits per pair. An empty fill leaves the position alone.
   Both fills have `exec` forms like `fill`.
+- `tandem::fill_exponential(view, rng)`: standard exponentials `-log(1 - u)` in a `float` or
+  `double` View, the sequence of `Rng::exponentialf` or `Rng::exponential` calls. Element `i`
+  comes from draw `i` of the Float32 (Float64) fill, so the fill consumes `n` draws. An empty fill
+  leaves the position alone.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
@@ -94,6 +98,7 @@ Spack or conda-forge yet, and both build from the `main` branch.
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
 | `normal()`, `normalf()`, `normal(mean, sd)` | the cos half of a Box-Muller step from two Float64 or Float32 draws |
 | `normal2()`, `normalf2()` | both halves of the step as a pair `z0`, `z1` |
+| `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
 
@@ -103,11 +108,11 @@ half type, which the conda-forge build for macOS lacks: there `half_t` is `float
 writes Float32 draws. A View that is not contiguous, such as a column of a `LayoutRight` matrix,
 throws `std::invalid_argument`.
 
-Bounded and normal draws are not part of the specification, so other ports may produce other
-values for them. The bounded and normal fills follow the contract in `core.hpp` and the same
-fills in tandem-cuda. Device `log` and `cos` differ from the host's in the last bits, so a
-normal fill agrees across backends to a few ulps, not bit for bit. Host backends write the
-values of the scalar `normal2()` and `normalf2()` calls exactly, and the same bits as tandem-c and tandem-cuda's host code on every compiler and CPU, because `core.hpp` fuses its multiply-adds explicitly. Build with `-ffp-contract=off`, and with `-mfma` on x86 so the fused operations stay inline. The method names and the `MAX_*` constants follow the Kokkos generators, so
+Bounded, normal and exponential draws follow the specification's non-normative Appendix A and
+the same fills in tandem-cuda. `core.hpp` computes `log`, `sin` and `cos` with polynomials whose
+multiply-adds are explicit fused ones, so every backend writes tandem-c's bits for bounded
+integers, double normals and exponentials, and host backends do for float normals. CUDA float
+normals take the fast `__sincosf` and agree to 16 ulps + 1e-6. Build with `-ffp-contract=off`, and with `-mfma` on x86 so the fused operations stay inline. The method names and the `MAX_*` constants follow the Kokkos generators, so
 `Kokkos::rand<tandem::Rng, T>::draw(rng, ...)` works.
 
 ### No `Kokkos::fill_random` pool
@@ -146,7 +151,11 @@ the bounded and normal draws. Bounded fills are checked against the contract in 
 written out on host generators, against the sequential `urand(range)` calls, against a fill cut in two, and against
 fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
 scalar `normal2()` calls from random positions and counts, odd and even, on host spaces bit for bit, against the shared hash of 1e6-pair fills at five starts (the one tandem-c's `dump_normals` and tandem-cuda's `host_core.cpp` produce), and against fixtures from tandem-cuda
-(`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: 16 ulps plus 1e-6 for float on CUDA, 8 ulps on host spaces, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
+(`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: bit for bit, except
+float on CUDA at 16 ulps plus 1e-6). Exponential fills are checked against the scalar
+`exponential()` calls with every kernel, against `cross_fill_exponential.h` from tandem-cuda and
+the hash of tandem-c's `tests/test_exponential_bits.c` on every backend, against a fill cut in
+two, and for the raw moments 1, 2, 6, 24 and a Kolmogorov-Smirnov test of Exp(1) on 1e7 draws. It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 
 ## Speed
@@ -156,7 +165,7 @@ machine. The chunk
 kernel, one scalar chunk per work item, shows what the vector row buys.
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
-fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. The CUDA normal fills run below tandem-cuda's own kernels on the same GPU (1100 and 686 GiB/s against 1290 and 765 at 2^28), a known gap with no further tuning planned. A normal pair costs a logarithm, a square root, a sine and a cosine and two
+fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. The CUDA normal fills run below tandem-cuda's own kernels on the same GPU (1099 and 815 GiB/s against 1270 and 833 at 2^28), a known gap with no further tuning planned. The exponential fills run the chunk kernel on devices, because the log makes them compute bound and the tile kernel's write phase then costs more than it gains: 1023 and 908 GiB/s at 2^28, against 1022 and 948 for tandem-cuda. A normal pair costs a logarithm, a square root, a sine and a cosine and two
 draws. The `uint8_t` fill writes one byte per draw and the 2^26 case runs 15% below 2^28.
 
 Timing every fill alone with its own fence lowers the 2^26 figures by up to 3.2% and the 2^28
@@ -171,6 +180,6 @@ to `KOKKOS_INLINE_FUNCTION` when Kokkos is included first, to `__host__ __device
 nvcc or hipcc, and to `inline` otherwise. It holds `T`, `F`, `F_keyed`, `block`, the stream
 position arithmetic, the float mappings including `to_f16_bits`, `Rng` on the `Draws<D>` base
 that device generators share, `GenState`, the bounded-fill helpers `below_u32` and `below_u64`
-with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, `box_muller2` and `box_muller2_f32` with the host blocks `normal_block_f64` and `normal_block_f32`, and `Row`, the
+with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, `box_muller2` and `box_muller2_f32` with the host blocks `normal_block_f64` and `normal_block_f32`, `exponential_f64` and `exponential_f32`, and `Row`, the
 eight lanes of a group. HIP and
 SYCL ports can reuse it and add only their fill kernels.

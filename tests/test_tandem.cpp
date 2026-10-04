@@ -1,5 +1,6 @@
 // Spec vectors, reference stream dumps, fills against in-kernel draws, split fills, derived
 // keys, bounded draws, and byte identity across backends, on every enabled execution space.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <tandem/kokkos.hpp>
 
 #include "../external/tandem-cuda/tests/cross_fill_below.h"
+#include "../external/tandem-cuda/tests/cross_fill_exponential.h"
 #include "../external/tandem-cuda/tests/cross_fill_normal.h"
 #include "cross_normal.h"
 #include "vectors.hpp"
@@ -753,6 +755,128 @@ template <class Exec> static void test_normal_bits() {
     }
 }
 
+// ---- Exponential fills ----------------------------------------------------------------------
+
+template <class Exec, class E>
+static std::vector<E> device_exponential(const Key &key, uint64_t pos, uint32_t K, size_t n,
+                                         Kernel kernel, size_t shift, uint64_t *end) {
+    using Kind =
+        std::conditional_t<std::is_same_v<E, float>, tandem::detail::exp32, tandem::detail::exp64>;
+    Kokkos::View<E *, typename Exec::memory_space> buf("exponential", n + 4);
+    auto out = Kokkos::subview(buf, Kokkos::pair<size_t, size_t>(shift, shift + n));
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill_kind<Exec, Kind>(Exec(), out.data(), n, r, kernel);
+    Exec().fence();
+    *end = r.position();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    return std::vector<E>(host.data(), host.data() + n);
+}
+
+// A fill equals the scalar exponential() calls on the host, bit for bit, with every kernel.
+template <class Exec, class E> static void check_exponential(const char *label) {
+    for (const Trial &t : trials(43, 12)) {
+        Rng r = Rng::from_key(t.key, t.pos, t.K);
+        std::vector<E> want(t.n);
+        for (E &x : want)
+            if constexpr (std::is_same_v<E, float>)
+                x = r.exponentialf();
+            else
+                x = r.exponential();
+        for (Kernel kernel : kernels<Exec>()) {
+            uint64_t end;
+            auto got = device_exponential<Exec, E>(t.key, t.pos, t.K, t.n, kernel, t.shift, &end);
+            bool ok = std::memcmp(want.data(), got.data(), t.n * sizeof(E)) == 0;
+            CHECK(ok);
+            CHECK(t.n == 0 || end == r.position());
+            if (!ok)
+                std::printf("  %s exponential %s (K=%u pos=%llu n=%zu shift=%zu)\n", label,
+                            name(kernel), t.K, (unsigned long long)t.pos, t.n, t.shift);
+        }
+    }
+}
+
+// tandem-cuda's fixtures and the hash of tandem-c's tests/test_exponential_bits.c, on every
+// backend. A fill cut in two equals the whole fill, and an empty fill keeps the position.
+template <class Exec> static void test_exponential() {
+    check_exponential<Exec, double>("f64");
+    check_exponential<Exec, float>("f32");
+
+    const Key k42 = Rng(42).key();
+    for (const auto &f : CROSS_EXP64) {
+        uint64_t end;
+        auto v = device_exponential<Exec, double>(k42, f.pos, 32, f.n, kernels<Exec>()[0], 0, &end);
+        CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0);
+        CHECK(end == tandem::align_pos(f.pos, 64) + 64 * f.n);
+    }
+    for (const auto &f : CROSS_EXP32) {
+        uint64_t end;
+        auto v = device_exponential<Exec, float>(k42, f.pos, 32, f.n, kernels<Exec>()[0], 0, &end);
+        CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(float)) == 0);
+        CHECK(end == tandem::align_pos(f.pos, 32) + 32 * f.n);
+    }
+
+    Kokkos::View<double *, typename Exec::memory_space> whole("whole", 3001), cut("cut", 3001);
+    Rng a = Rng::from_key(k42, 12345, 32), b = a;
+    tandem::fill_exponential(Exec(), whole, a);
+    tandem::fill_exponential(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(0, 1234)), b);
+    tandem::fill_exponential(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(1234, 3001)), b);
+    Exec().fence();
+    auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), whole);
+    auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), cut);
+    CHECK(std::memcmp(hw.data(), hc.data(), 3001 * sizeof(double)) == 0);
+    CHECK(a.position() == b.position());
+
+    Kokkos::View<float *, typename Exec::memory_space> none("none", 0);
+    Rng r = Rng::from_key(k42, 1, 32);
+    tandem::fill_exponential(Exec(), none, r);
+    CHECK(r.position() == 1);
+
+    constexpr size_t n = 1000000;
+    uint64_t h = 0xcbf29ce484222325ull;
+    Kokkos::View<double *, typename Exec::memory_space> d("d", n);
+    Kokkos::View<float *, typename Exec::memory_space> f("f", n);
+    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
+        Rng g(2026, 7, 0);
+        g.set_position(start);
+        tandem::fill_exponential(Exec(), d, g);
+        auto hd = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
+        tandem::fill_exponential(Exec(), f, g);
+        auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), f);
+        for (size_t i = 0; i < n * sizeof(double); i++)
+            h = (h ^ reinterpret_cast<const unsigned char *>(hd.data())[i]) * 0x100000001b3ull;
+        for (size_t i = 0; i < n * sizeof(float); i++)
+            h = (h ^ reinterpret_cast<const unsigned char *>(hf.data())[i]) * 0x100000001b3ull;
+    }
+    CHECK(h == 0x47f8f98297d94ee2ull);
+}
+
+// Exp(1) on 1e7 draws: raw moments 1, 2, 6, 24 within five standard errors, and the
+// Kolmogorov-Smirnov distance below its p = 0.001 critical value 1.95 / sqrt(n).
+template <class E> static void test_exponential_law() {
+    constexpr size_t n = 10000000;
+    Kokkos::View<E *, Kokkos::HostSpace> v("v", n);
+    Rng r(2026, 10, 4);
+    tandem::fill_exponential(Kokkos::DefaultHostExecutionSpace(), v, r);
+    Kokkos::fence();
+    std::vector<double> x(v.data(), v.data() + n);
+    double m[4] = {0, 0, 0, 0};
+    for (double e : x) {
+        double p = e;
+        for (int k = 0; k < 4; k++, p *= e)
+            m[k] += p;
+    }
+    const double want[4] = {1, 2, 6, 24}, var[4] = {1, 20, 684, 39744};
+    for (int k = 0; k < 4; k++)
+        CHECK(std::abs(m[k] / n - want[k]) < 5 * std::sqrt(var[k] / n));
+    std::sort(x.begin(), x.end());
+    double ks = 0;
+    for (size_t i = 0; i < n; i++) {
+        double F = -std::expm1(-x[i]);
+        ks = std::max(ks, std::max(F - (double)i / n, (double)(i + 1) / n - F));
+    }
+    CHECK(ks < 1.95 / std::sqrt((double)n));
+}
+
 // ---- Value types ---------------------------------------------------------------------------
 
 // Fills of narrow and signed integers take the bits of the u32 stream at their own alignment.
@@ -895,6 +1019,7 @@ template <class Exec> static void run(const char *space, const std::string &dir)
     test_below<Exec>();
     test_normal<Exec>();
     test_normal_bits<Exec>();
+    test_exponential<Exec>();
     std::printf("%s: %ld checks, %ld failures\n", space, checks - c0, failures - f0);
 }
 
@@ -953,6 +1078,8 @@ int main(int argc, char **argv) {
     Kokkos::ScopeGuard guard(argc, argv);
     std::string dir = argc > 1 ? argv[argc - 1] : "tests/data";
     run<Kokkos::Serial>("Serial", dir);
+    test_exponential_law<double>();
+    test_exponential_law<float>();
 #ifdef KOKKOS_ENABLE_OPENMP
     run<Kokkos::OpenMP>("OpenMP", dir);
     compare_with_serial<Kokkos::OpenMP>("OpenMP");

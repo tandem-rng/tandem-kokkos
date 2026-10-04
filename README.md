@@ -42,6 +42,7 @@ Kokkos::View<uint32_t *> die("die", n);
 tandem::fill_below(die, rng, 6u);          // uniform on [0, 6)
 Kokkos::View<float *> g("g", n);
 tandem::fill_normal(g, rng);               // standard normals
+tandem::fill_exponential(g, rng);          // standard exponentials
 
 Kokkos::View<float *> y("y", m);
 Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
@@ -58,7 +59,9 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 - `tandem::fill_f16_bits(view, rng)`: binary16 bit patterns in a `uint16_t` View.
 - `tandem::fill_below(view, rng, range)`: bounded `uint32_t` and `uint64_t` by Lemire's method.
 - `tandem::fill_normal(view, rng)`: `float` and `double` normals by Box-Muller.
-- `tandem::Rng`: draws in kernels, `bit`, `urand`, `frand`, `drand`, `normal`, `normal2`.
+- `tandem::fill_exponential(view, rng)`: `float` and `double` exponentials, `-log(1 - u)`.
+- `tandem::Rng`: draws in kernels, `bit`, `urand`, `frand`, `drand`, `normal`, `normal2`,
+  `exponential`.
 - `Rng::at_urand(i)` and the other `at_` forms: random access without advancing.
 - `Rng::split(i)`, `sub(purpose)`, `fork(children, n)`: child generators.
 - `Rng::key()`, `position()`, `set_position(p)`: transport form.
@@ -66,10 +69,11 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 - No `Kokkos::fill_random` pool: pools hand out states by scheduling and are not reproducible.
 - `tandem/core.hpp`: the portable core from tandem-cuda, reusable by other backends.
 
-Bounded and normal draws are not in the specification. Normals agree across backends to a few
-ulps. Host backends match tandem-c bit for bit when built with `-ffp-contract=off`, and with
-`-mfma` on x86. A non-contiguous View throws `std::invalid_argument`. Where Kokkos has no half
-type, as in the conda-forge build for macOS, `half_t` is `float`.
+Bounded, normal and exponential draws follow the specification's non-normative Appendix A.
+They match tandem-c bit for bit, except float normals on CUDA, which agree to 16 ulps + 1e-6.
+Host backends need `-ffp-contract=off`, and `-mfma` on x86. A non-contiguous View throws
+`std::invalid_argument`. Where Kokkos has no half type, as in the conda-forge build for macOS,
+`half_t` is `float`.
 
 ## Tests
 
@@ -77,7 +81,8 @@ type, as in the conda-forge build for macOS, `half_t` is `float`.
 
 - Every vector of the specification, from `tests/vectors.hpp`, made by `tools/gen_vectors.py`.
 - Stream dumps from tandem-c in `tests/data` for every type, plus random keys, positions and cuts.
-- Bounded and normal fills against the fixtures of tandem-cuda and tandem-c.
+- Bounded, normal and exponential fills against the fixtures of tandem-cuda and tandem-c.
+- Exponentials: the moments and a Kolmogorov-Smirnov test of Exp(1) on 1e7 draws.
 - Every backend writes the bytes Serial writes.
 
 ## Speed
@@ -122,10 +127,14 @@ The other fills on the same GPU:
 | `fill_below`, `uint32_t` | 2^28 | 1342 |
 | `fill_below`, `uint64_t` | 2^26 | 1309 |
 | `fill_below`, `uint64_t` | 2^28 | 1328 |
-| `fill_normal`, `float` | 2^26 | 1091 |
-| `fill_normal`, `float` | 2^28 | 1100 |
-| `fill_normal`, `double` | 2^26 | 674 |
-| `fill_normal`, `double` | 2^28 | 686 |
+| `fill_normal`, `float` | 2^26 | 1096 |
+| `fill_normal`, `float` | 2^28 | 1099 |
+| `fill_normal`, `double` | 2^26 | 819 |
+| `fill_normal`, `double` | 2^28 | 815 |
+| `fill_exponential`, `float` | 2^26 | 1020 |
+| `fill_exponential`, `float` | 2^28 | 1023 |
+| `fill_exponential`, `double` | 2^26 | 892 |
+| `fill_exponential`, `double` | 2^28 | 908 |
 
 `fill_below` uses range 1000.
 

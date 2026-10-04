@@ -27,6 +27,8 @@ namespace detail {
 struct f16_bits {}; /* binary16 bit patterns of the Float16 draws, stored as uint16_t */
 struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW32 */
 struct below64 {};
+struct exp32 {}; /* exponentials over the f32 fill, see exponential_f32 */
+struct exp64 {};
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
  * what the bounded kinds need: the fill's key and chunk length, and the range. */
@@ -106,6 +108,22 @@ template <> struct elem<double> {
         return to_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32));
     }
 };
+template <> struct elem<exp32> {
+    using out_t = float;
+    static constexpr unsigned bits = 32;
+    KOKKOS_INLINE_FUNCTION static float make(const uint32_t w[4], unsigned k, uint64_t,
+                                             const Span &) {
+        return exponential_f32(to_f32(w[k]));
+    }
+};
+template <> struct elem<exp64> {
+    using out_t = double;
+    static constexpr unsigned bits = 64;
+    KOKKOS_INLINE_FUNCTION static double make(const uint32_t w[4], unsigned k, uint64_t,
+                                              const Span &) {
+        return exponential_f64(to_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32)));
+    }
+};
 template <> struct elem<below32> {
     using out_t = uint32_t;
     static constexpr unsigned bits = 32;
@@ -176,6 +194,15 @@ KOKKOS_INLINE_FUNCTION void store_row(typename elem<Kind>::out_t *dst, const Row
         R.store(reinterpret_cast<uint32_t *>(dst));
     } else if constexpr (std::is_same_v<Kind, float> || std::is_same_v<Kind, double>) {
         R.store(dst);
+    } else if constexpr (std::is_same_v<Kind, exp32> || std::is_same_v<Kind, exp64>) {
+        /* Uniforms first, then the log in place, a loop the compiler vectorizes. */
+        R.store(dst);
+        for (unsigned k = 0; k < 1024 / elem<Kind>::bits; k++) {
+            if constexpr (std::is_same_v<Kind, exp32>)
+                dst[k] = exponential_f32(dst[k]);
+            else
+                dst[k] = exponential_f64(dst[k]);
+        }
     } else {
         constexpr unsigned per_row = 1024 / elem<Kind>::bits, per_block = 128 / elem<Kind>::bits;
         uint32_t w[32];
@@ -730,6 +757,31 @@ template <class View> void fill_normal(const View &view, Rng &rng) {
     typename View::execution_space exec;
     fill_normal(exec, view, rng);
     exec.fence("tandem::fill_normal: fence after the fill");
+}
+
+/* Standard exponentials -log(1 - u) in a float or double View, the sequence of
+ * Rng::exponentialf or Rng::exponential calls: element i from draw i of the f32 or f64 fill.
+ * Specification Appendix A, bit for bit equal to tandem-c on every backend. An empty fill leaves
+ * the position alone. */
+template <class Exec, class View>
+void fill_exponential(const Exec &exec, const View &view, Rng &rng) {
+    using E = typename View::non_const_value_type;
+    static_assert(std::is_same_v<E, float> || std::is_same_v<E, double>,
+                  "tandem::fill_exponential: the value type must be float or double");
+    detail::check_view<Exec>(view, "tandem::fill_exponential");
+    if (view.size() == 0) /* no draws, so no alignment either */
+        return;
+    using Kind = std::conditional_t<std::is_same_v<E, float>, detail::exp32, detail::exp64>;
+    /* The log makes a device fill compute bound, and there the tile kernel's separate write
+     * phase costs more than its coalescing gains. */
+    detail::fill_kind<Exec, Kind>(exec, view.data(), view.size(), rng,
+                                  detail::is_host<Exec> ? detail::Kernel::Auto
+                                                        : detail::Kernel::Chunk);
+}
+template <class View> void fill_exponential(const View &view, Rng &rng) {
+    typename View::execution_space exec;
+    fill_exponential(exec, view, rng);
+    exec.fence("tandem::fill_exponential: fence after the fill");
 }
 
 } // namespace tandem

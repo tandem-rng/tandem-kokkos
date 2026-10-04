@@ -1,6 +1,6 @@
 // Fill throughput: tandem::fill with its default kernel and with the chunk kernel, and
-// Kokkos::fill_random with Random_XorShift64_Pool, then the narrow, complex, bounded and normal
-// fills. Each row: a half-second warm-up, then the
+// Kokkos::fill_random with Random_XorShift64_Pool, then the narrow, complex, bounded, normal and
+// exponential fills. Each row: a half-second warm-up, then the
 // minimum over `runs` runs of the time per fill of `batch` back-to-back fills and one fence.
 // A batch of 1 includes the launch and fence latency in every fill.
 //
@@ -78,6 +78,10 @@ template <class Exec> static void bench_more(int lg) {
     Kokkos::View<double *, M> g64("g64", n);
     row("tandem::fill_normal", "f64", lg, 8,
         best_seconds(exec, [&] { tandem::fill_normal(exec, g64, rng); }));
+    row("tandem::fill_exponential", "f32", lg, 4,
+        best_seconds(exec, [&] { tandem::fill_exponential(exec, g32, rng); }));
+    row("tandem::fill_exponential", "f64", lg, 8,
+        best_seconds(exec, [&] { tandem::fill_exponential(exec, g64, rng); }));
 }
 
 template <class Exec> static void bench(const std::vector<int> &logs) {
