@@ -621,15 +621,23 @@ template <class Exec> static void test_below() {
     }
 }
 
-// Normals agree across devices and hardware to a few ulps. A host fill does the arithmetic of
-// the scalar normal2() calls and equals them exactly. The host's polynomial differs from the
-// device's sincospi near a zero of cos or sin by about 1e-15 in absolute terms, which the
-// absolute floor covers, and fused multiply-adds change the last bit between machines.
+// Normals agree across devices to a few ulps. The host's polynomial differs from the device's
+// sincospi near a zero of cos or sin by about 1e-15 in absolute terms, which the absolute floor
+// covers.
 template <class E> static bool near_normal(E got, E want, float ulps = 16.0f) {
     if constexpr (std::is_same_v<E, double>)
         return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-14;
     else
         return std::abs(got - want) <= ulps * 0x1p-23f * std::abs(want) + 1e-6f;
+}
+
+// A host fill runs core.hpp's explicit-fma Box-Muller, which equals the scalar normal2() calls
+// and the other host fills bit for bit. A device differs in the last bits.
+template <class Exec, class E> static bool same_normal(E got, E want) {
+    if constexpr (tandem::detail::is_host<Exec>)
+        return std::memcmp(&got, &want, sizeof got) == 0;
+    else
+        return near_normal(got, want);
 }
 
 template <class Exec, class E>
@@ -671,7 +679,7 @@ template <class Exec, class E> static void check_normal(const char *label) {
         auto got = device_normal<Exec, E>(t.key, t.pos, t.K, t.n, t.shift, &end);
         bool ok = true;
         for (size_t i = 0; i < t.n; i++)
-            ok = ok && (tandem::detail::is_host<Exec> ? got[i] == want[i] : near_normal(got[i], want[i]));
+            ok = ok && same_normal<Exec>(got[i], want[i]);
         CHECK(ok);
         CHECK(end == r.position());
         if (!ok)
@@ -680,6 +688,7 @@ template <class Exec, class E> static void check_normal(const char *label) {
     }
 }
 
+// The fixtures predate the explicit-fma core, so a host fill matches them to a tolerance only.
 // Fixtures from tandem-cuda at positions that put the first pair at an even and an odd draw,
 // with an odd count, and empty fills, which leave the position alone.
 template <class Exec> static void test_normal() {
@@ -729,6 +738,31 @@ template <class Exec> static void test_normal() {
     Rng r = Rng::from_key(k42, 1, 32);
     tandem::fill_below(Exec(), none, r, 7u);
     CHECK(r.position() == 1);
+}
+
+// The hash tandem-c's tools/dump_normals and tandem-cuda's host_core.cpp print for the same fills:
+// one bit pattern on every compiler and port.
+template <class Exec> static void test_normal_bits() {
+    if constexpr (tandem::detail::is_host<Exec>) {
+        constexpr size_t n = 2 * 1000000 - 1;
+        uint64_t h = 0xcbf29ce484222325ull;
+        auto fnv = [&h](const void *p, size_t bytes) {
+            for (size_t i = 0; i < bytes; i++)
+                h = (h ^ static_cast<const unsigned char *>(p)[i]) * 0x100000001b3ull;
+        };
+        Kokkos::View<double *, typename Exec::memory_space> d("d", n);
+        Kokkos::View<float *, typename Exec::memory_space> f("f", n);
+        for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
+            Rng r(2026, 7, 0);
+            r.set_position(start);
+            tandem::fill_normal(Exec(), d, r);
+            tandem::fill_normal(Exec(), f, r);
+            Exec().fence();
+            fnv(d.data(), n * sizeof(double));
+            fnv(f.data(), n * sizeof(float));
+        }
+        CHECK(h == 0x9414e1315e2653beull);
+    }
 }
 
 // ---- Value types ---------------------------------------------------------------------------
@@ -872,6 +906,7 @@ template <class Exec> static void run(const char *space, const std::string &dir)
     test_ranks<Exec>();
     test_below<Exec>();
     test_normal<Exec>();
+    test_normal_bits<Exec>();
     std::printf("%s: %ld checks, %ld failures\n", space, checks - c0, failures - f0);
 }
 
@@ -891,7 +926,6 @@ template <class Exec, class E> static void same_as_serial(const char *space) {
 // Bounded fills are integers and equal Serial's bytes. Normals equal them on host spaces and
 // agree to a few ulps on devices.
 template <class Exec> static void same_as_serial_below_normal(const char *space) {
-    constexpr bool host = tandem::detail::is_host<Exec>;
     for (const Trial &t : trials(78, 12)) {
         uint64_t e1, e2;
         auto w32 = device_below<Kokkos::Serial, uint32_t>(t.key, t.pos, t.K, t.n, 6000001u,
@@ -903,7 +937,7 @@ template <class Exec> static void same_as_serial_below_normal(const char *space)
         auto gn = device_normal<Exec, double>(t.key, t.pos, t.K, t.n, t.shift, &e2);
         bool ok = e1 == e2;
         for (size_t i = 0; i < t.n; i++)
-            ok = ok && (host ? wn[i] == gn[i] : near_normal(gn[i], wn[i]));
+            ok = ok && same_normal<Exec>(gn[i], wn[i]);
         CHECK(ok);
         if (!ok)
             std::printf("  %s normal differs from Serial\n", space);

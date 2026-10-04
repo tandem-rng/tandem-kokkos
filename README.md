@@ -85,7 +85,7 @@ Bounded and normal draws are not part of the specification, so other ports may p
 values for them. The bounded and normal fills follow the contract in `core.hpp` and the same
 fills in tandem-cuda. Device `log` and `cos` differ from the host's in the last bits, so a
 normal fill agrees across backends to a few ulps, not bit for bit. Host backends write the
-values of the scalar `normal2()` and `normalf2()` calls exactly, on one machine. The method names and the `MAX_*` constants follow the Kokkos generators, so
+values of the scalar `normal2()` and `normalf2()` calls exactly, and the same bits as tandem-c and tandem-cuda's host code on every compiler and CPU, because `core.hpp` fuses its multiply-adds explicitly. Build with `-ffp-contract=off`, and with `-mfma` on x86 so the fused operations stay inline. The method names and the `MAX_*` constants follow the Kokkos generators, so
 `Kokkos::rand<tandem::Rng, T>::draw(rng, ...)` works.
 
 ### No `Kokkos::fill_random` pool
@@ -171,7 +171,7 @@ one stream, checks mixed-width draws, random access, derived keys and fork posit
 the bounded and normal draws. Bounded fills are checked against the contract in `core.hpp`
 written out on host generators, against the sequential `urand(range)` calls, against a fill cut in two, and against
 fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
-scalar `normal2()` calls from random positions and counts, odd and even, and against fixtures from tandem-cuda
+scalar `normal2()` calls from random positions and counts, odd and even, on host spaces bit for bit, against the shared hash of 1e6-pair fills at five starts (the one tandem-c's `dump_normals` and tandem-cuda's `host_core.cpp` produce), and against fixtures from tandem-cuda
 (`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: 16 ulps plus 1e-6 for float on CUDA, 8 ulps on host spaces, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
