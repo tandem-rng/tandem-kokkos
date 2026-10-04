@@ -1,5 +1,7 @@
 # API
 
+## Use
+
 ```cpp
 #include <tandem/kokkos.hpp>
 
@@ -23,6 +25,8 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
     y(i) = r.frand() + r.frand();
 });
 ```
+
+## Reference
 
 - `tandem::fill(exec, view, rng)` and `tandem::fill(view, rng)`: fill a contiguous
   `Kokkos::View` of any rank and layout with the draws that start at the generator's position,
@@ -93,7 +97,9 @@ depends on scheduling, so no pool adaptor can make that fill reproducible. `tand
 replaces it, and in your own kernels `rng.split(i)` keyed by the work item index gives every
 item its own stream.
 
-Parallel use: element `i` of a fill is draw `i`, so ranks, threads or devices that start at the
+## Parallel use
+
+Element `i` of a fill is draw `i`, so ranks, threads or devices that start at the
 position of their first element, or draw from `split(task)`, reproduce a serial run for any
 decomposition, as
 [Appendix B](https://github.com/tandem-rng/spec/blob/main/SPEC.md#appendix-b-parallel-decomposition-non-normative)

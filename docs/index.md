@@ -1,11 +1,15 @@
-# tandem-kokkos documentation
+# tandem-kokkos
+
+[Kokkos](https://kokkos.org) implementation of Tandem8x32. It produces the stream of the
+[specification](https://github.com/tandem-rng/spec/blob/main/SPEC.md) bit for bit on every
+Kokkos backend. Two headers, C++20, no compiled library.
 
 - [API](api.md): `tandem::fill` and the other fills, `tandem::Rng` draws and parallel use.
 - [Design](design.md): the kernels and the portable core.
-- [Tests](tests.md): what the suite checks.
+- [Tests](tests.md): what the suite checks, where the fixtures come from, and what CI runs.
 - [Speed](speed.md): M4 Pro and A100 figures against `Kokkos::fill_random`.
 
-## Build
+## Install
 
 Header-only. Clone with the submodule:
 
@@ -47,8 +51,6 @@ driver than the 570 on the GPU host, so the toolkit stays at 12.8:
 pixi run -e cuda kokkos               # KOKKOS_ARCH=AMPERE80 by default
 pixi run -e cuda test-cuda
 ```
-
-## Packaging
 
 The `packaging/` directory holds a Spack recipe (`spack/package.py`, with `openmp` and `cuda` variants)
 and a conda-forge style recipe (`conda/recipe.yaml`, Serial and OpenMP Kokkos). Neither is submitted to

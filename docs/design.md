@@ -1,6 +1,6 @@
 # Design
 
-## Kernels
+## Fills
 
 On host execution spaces a work item steps the eight chunks of a group together, a whole
 1024-bit row per step. With GCC 12+ or clang the row lives in 128-bit vectors (NEON or

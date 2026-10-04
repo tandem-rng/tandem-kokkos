@@ -1,6 +1,9 @@
 # Speed
 
 `tools/bench.cpp` (`-DTANDEM_BENCH=ON`): half-second warm-up, minimum of 15 runs, GiB/s written.
+
+## CPU
+
 Apple M4 Pro, clang 21, Kokkos 5.2.1, OpenMP with 10 threads (`OMP_PROC_BIND=spread`).
 
 | | elements | `uint32_t` | `uint64_t` | `float` | `double` |
@@ -13,6 +16,12 @@ Apple M4 Pro, clang 21, Kokkos 5.2.1, OpenMP with 10 threads (`OMP_PROC_BIND=spr
 | OpenMP, `tandem::fill` | 2^28 | 107 | 109 | 111 | 109 |
 | OpenMP, chunk kernel | 2^28 | 71 | 68 | 67 | 65 |
 | OpenMP, `Kokkos::fill_random`, `Random_XorShift64_Pool` | 2^28 | 21 | 37 | 23 | 44 |
+
+At 2^24 elements the Serial fill runs within 5% of tandem-c's single-thread fill on the same
+machine. The chunk
+kernel, one scalar chunk per work item, shows what the vector row buys.
+
+## GPU
 
 NVIDIA A100 40 GB (PCIe), CUDA 12.8, Kokkos 5.2.2 built for `AMPERE80`, GPU idle. Eight
 back-to-back fills and one fence.
@@ -49,10 +58,6 @@ The other fills on the same GPU:
 | `fill_exponential`, `double` | 2^28 | 908 |
 
 `fill_below` uses range 1000.
-
-At 2^24 elements the Serial fill runs within 5% of tandem-c's single-thread fill on the same
-machine. The chunk
-kernel, one scalar chunk per work item, shows what the vector row buys.
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
 fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. The CUDA normal fills run below tandem-cuda's own kernels on the same GPU (1099 and 815 GiB/s against 1270 and 833 at 2^28), a known gap with no further tuning planned. The exponential fills run the chunk kernel on devices, because the log makes them compute bound and the tile kernel's write phase then costs more than it gains: 1023 and 908 GiB/s at 2^28, against 1022 and 948 for tandem-cuda. A normal pair costs a logarithm, a square root, a sine and a cosine and two

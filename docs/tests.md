@@ -1,5 +1,13 @@
 # Tests
 
+```sh
+pixi run test                         # Serial and OpenMP
+pixi run -e gcc test-gcc              # the same with GCC 14 on Linux
+pixi run -e cuda test-cuda            # Serial, OpenMP and CUDA on a GPU host
+```
+
+## Suite
+
 `pixi run test` runs `tests/test_tandem.cpp` on every enabled backend.
 
 - Every vector of the specification, from `tests/vectors.hpp`, made by `tools/gen_vectors.py`.
@@ -24,3 +32,18 @@ float on CUDA at 16 ulps plus 1e-6). Exponential fills are checked against the s
 the hash of tandem-c's `tests/test_exponential_bits.c` on every backend, against a fill cut in
 two, and for the raw moments 1, 2, 6, 24 and a Kolmogorov-Smirnov test of Exp(1) on 1e7 draws. It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
+
+## Fixtures
+
+`tests/vectors.hpp` is made by `tools/gen_vectors.py` from the specification's vectors. The
+stream dumps in `tests/data` come from tandem-c. `cross_fill_normal.h` and
+`cross_fill_exponential.h` come from tandem-cuda, and `cross_normal.h` and the hashes of
+`dump_normals` and `tests/test_exponential_bits.c` from tandem-c.
+
+## CI
+
+- Ubuntu and macOS with clang, Ubuntu with GCC, and Ubuntu with clang and `-DTANDEM_NO_SIMD`.
+  Each builds with `-Wall -Wextra -Werror` and the benchmark, then runs `ctest` with four OpenMP
+  threads.
+- One job checks that the vector header is current, and one that the tandem-cuda pin is on
+  its main branch.
