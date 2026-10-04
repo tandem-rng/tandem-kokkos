@@ -195,6 +195,28 @@ run. Time per fill over eight back-to-back fills and one fence:
 | `Kokkos::fill_random`, `Random_XorShift64_Pool` | 2^28 | 95 | 130 | 95 | 105 |
 | tandem-cuda tile kernel, `cudaEvent` timing, same session | 2^28 | 1385 | 1394 | 1379 | 1393 |
 
+The other fills on the same GPU, GiB/s written, eight back-to-back fills per run, `tandem::fill_below`
+with range 1000:
+
+| | elements | GiB/s |
+|---|---|---|
+| `fill`, `uint8_t` | 2^26 | 1088 |
+| `fill`, `uint8_t` | 2^28 | 1245 |
+| `fill`, `Kokkos::complex<double>` | 2^26 | 1324 |
+| `fill`, `Kokkos::complex<double>` | 2^28 | 1345 |
+| `fill_below`, `uint32_t` | 2^26 | 1273 |
+| `fill_below`, `uint32_t` | 2^28 | 1341 |
+| `fill_below`, `uint64_t` | 2^26 | 1295 |
+| `fill_below`, `uint64_t` | 2^28 | 1320 |
+| `fill_normal`, `float` | 2^26 | 378 |
+| `fill_normal`, `float` | 2^28 | 380 |
+| `fill_normal`, `double` | 2^26 | 337 |
+| `fill_normal`, `double` | 2^28 | 344 |
+
+The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
+fill of the same width. A normal element costs a logarithm, a square root and a cosine and two
+draws. The `uint8_t` fill writes one byte per draw and the 2^26 case runs 15% below 2^28.
+
 Timing every fill alone with its own fence lowers the 2^26 figures by up to 3.2% and the 2^28
 figures by under 1%. The tile kernel runs 3-4% below the same kernel written in CUDA. The chunk
 kernel runs within 1% of tandem-cuda's direct kernel (1309 to 1324 GiB/s).
