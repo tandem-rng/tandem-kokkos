@@ -29,6 +29,7 @@ struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW
 struct below64 {};
 struct exp32 {}; /* exponentials over the f32 fill, see exponential_f32 */
 struct exp64 {};
+struct norm64 {}; /* ziggurat normals over the u64 fill, see normal_f64 */
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
  * what the bounded kinds need: the fill's key and chunk length, and the range. */
@@ -122,6 +123,15 @@ template <> struct elem<exp64> {
     KOKKOS_INLINE_FUNCTION static double make(const uint32_t w[4], unsigned k, uint64_t,
                                               const Span &) {
         return exponential_f64(to_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32)));
+    }
+};
+template <> struct elem<norm64> {
+    using out_t = double;
+    static constexpr unsigned bits = 64;
+    KOKKOS_INLINE_FUNCTION static double make(const uint32_t w[4], unsigned k, uint64_t e,
+                                              const Span &s) {
+        return normal_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.key.w, s.K,
+                          (s.p0 >> 6) + e);
     }
 };
 template <> struct elem<below32> {
@@ -414,26 +424,15 @@ KOKKOS_FORCEINLINE_FUNCTION Pair2<float> normal_step_f32(float a, float b) {
 #endif
 }
 
-/* The normal pair of the uniforms in the words v: two Float64 draws (four words) or two Float32
- * draws (two words). */
-template <class O> KOKKOS_FORCEINLINE_FUNCTION Pair2<O> normal_pair(const uint32_t *v) {
-    if constexpr (std::is_same_v<O, double>)
-        return box_muller2(to_f64(v[0] | ((uint64_t)v[1] << 32)),
-                           to_f64(v[2] | ((uint64_t)v[3] << 32)));
-    else
-        return normal_step_f32(to_f32(v[0]), to_f32(v[1]));
-}
-
-/* Elements 2i and 2i + 1 of an n-element fill. `wide` says the pair sits at a 2 sizeof(O)
- * aligned address. */
-template <class O>
-KOKKOS_FORCEINLINE_FUNCTION void store_pair(O *dst, bool wide, uint64_t n, uint64_t i,
-                                            Pair2<O> z) {
+/* Elements 2i and 2i + 1 of an n-element fill. `wide` says the pair sits at an 8-byte aligned
+ * address. */
+KOKKOS_FORCEINLINE_FUNCTION void store_pair(float *dst, bool wide, uint64_t n, uint64_t i,
+                                            Pair2<float> z) {
     if (2 * i + 1 >= n) {
         dst[2 * i] = z.z0;
     } else if (wide) {
-        struct alignas(2 * sizeof(O)) Two {
-            O v[2];
+        struct alignas(8) Two {
+            float v[2];
         } two = {{z.z0, z.z1}};
         *reinterpret_cast<Two *>(dst + 2 * i) = two;
     } else {
@@ -442,27 +441,26 @@ KOKKOS_FORCEINLINE_FUNCTION void store_pair(O *dst, bool wide, uint64_t n, uint6
     }
 }
 
-/* Normal fill by Box-Muller pairs: pair j, the elements 2j and 2j + 1, comes from the L = 2
- * (float) or 4 (double) 32-bit stream slots that start at slot S + j L, S being the first slot
- * of the fill, with the cos half first. A work item owns the blocks that hold the last slot of
- * a pair. s.range is the element count, which an odd count leaves one past the last pair. A
- * pair goes out as one 16-byte (double) or 8-byte (float) store when the output allows it, and
- * two float pairs of one block as one 16-byte store when the fill starts on a block. With S % L != 0 an element can start in the
- * previous block, so the item also steps the chunk of that block, which for lane 0 is lane 7
- * one step back, or at step 0 the previous group's last chunk. */
-template <class O, bool STRADDLE, class Exec>
-void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb, O *out) {
-    constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
+/* Float normal fill by Box-Muller pairs: pair j, the elements 2j and 2j + 1, comes from the L = 2
+ * 32-bit stream slots that start at slot S + j L, S being the first slot of the fill, with the
+ * cos half first. A work item owns the blocks that hold the last slot of a pair. s.range is the
+ * element count, which an odd count leaves one past the last pair. A pair goes out as one 8-byte
+ * store when the output allows it, and the two pairs of one block as one 16-byte store when the
+ * fill starts on a block. With S odd a pair can start in the previous block, so the item also
+ * steps the chunk of that block, which for lane 0 is lane 7 one step back, or at step 0 the
+ * previous group's last chunk. */
+template <bool STRADDLE, class Exec>
+void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb, float *out) {
+    constexpr unsigned L = 2u;
     const uint64_t S = s.p0 >> 5, pairs = (s.p1 - s.p0) / (32u * L), n = s.range;
-    const bool wide = (reinterpret_cast<uintptr_t>(out) & (2 * sizeof(O) - 1)) == 0;
-    const bool quad = !STRADDLE && L == 2 && (S & 3u) == 0 &&
-                      (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
+    const bool wide = (reinterpret_cast<uintptr_t>(out) & 7u) == 0;
+    const bool quad = !STRADDLE && (S & 3u) == 0 && (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
     Kokkos::parallel_for(
         "tandem::fill_normal",
         Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, 0,
                                                               (int64_t)(8u * (s.g1 - s.g0 + 1u))),
         KOKKOS_LAMBDA(int64_t t) {
-            O *const dst = out;
+            float *const dst = out;
             uint64_t c = 8u * s.g0 + (uint64_t)t, g = c >> 3, lane = c & 7u, row = g * s.K;
             uint32_t o[4], h[4], po[4] = {0, 0, 0, 0}, ph[4] = {0, 0, 0, 0};
             F_keyed(s.key.w, c, DOMAIN_STREAM, AUX_STREAM, o, h);
@@ -487,15 +485,14 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
                     continue;
                 }
                 if (!STRADDLE) {
-                    /* S % L == 0: the pairs of the block end at its halves (float) or its end
-                     * (double), and lie inside it. */
-                    for (unsigned m = L == 2 ? 1u : 3u; m < 4; m += L) {
+                    /* S even: the pairs of the block end at its halves and lie inside it. */
+                    for (unsigned m = 1u; m < 4; m += L) {
                         uint64_t last = 4u * b + m + 1u; /* one past the pair's last slot */
                         if (last < S + L)
                             continue;
                         uint64_t i = (last - S) / L - 1u;
                         if (i < pairs)
-                            store_pair<O>(dst, wide, n, i, normal_pair<O>(o + (m + 1u - L)));
+                            store_pair(dst, wide, n, i, normal_step_f32(to_f32(o[m - 1u]), to_f32(o[m])));
                     }
                     continue;
                 }
@@ -516,7 +513,7 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
                         continue;
                     uint64_t i = (last - S) / L - 1u;
                     if (i < pairs)
-                        store_pair<O>(dst, wide, n, i, normal_pair<O>(x + (m + 5u - L)));
+                        store_pair(dst, wide, n, i, normal_step_f32(to_f32(x[m + 3u]), to_f32(x[m + 4u])));
                 }
             }
         });
@@ -527,64 +524,51 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 #endif
-/* Normal fill on host spaces: a work item steps the eight chunks of a group together and turns
- * the pairs that end in each row into normals with one normal_block call, which the compiler
- * vectorizes. The stream slots of a row are its 32 words, and the pairs are the L-word windows
- * at slots S + j L. A pair that starts in the previous row takes its first words from the
- * last three words of that row, `tail`, which for the first row of a group is the last block
- * of the previous group. */
-template <class O, class Exec> void fill_normal_group(const Exec &exec, const Span s, O *out) {
-    constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
+/* Float normal fill on host spaces: a work item steps the eight chunks of a group together and
+ * turns the pairs that end in each row into normals with one normal_block_f32 call, which the
+ * compiler vectorizes. The stream slots of a row are its 32 words, and the pairs are the 2-word
+ * windows at slots S + 2j. A pair that starts in the previous row takes its first word from the
+ * last word of that row, which for the first row of a group is the last block of the previous
+ * group. */
+template <class Exec> void fill_normal_group(const Exec &exec, const Span s, float *out) {
+    constexpr unsigned L = 2u;
     const uint64_t S = s.p0 >> 5, pairs = (s.p1 - s.p0) / (32u * L), n = s.range;
     Kokkos::parallel_for(
         "tandem::fill_normal (group)",
         Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, (int64_t)s.g0,
                                                               (int64_t)s.g1 + 1),
-        [=](int64_t g) { /* host only: normal_block_* are host functions */
+        [=](int64_t g) { /* host only: normal_block_f32 is a host function */
             Row R;
             R.seed(s.key.w, (uint64_t)g);
             uint64_t row = (uint64_t)g * s.K;
-            uint32_t w[35] = {0, 0, 0}; /* the three words before the row, then the row */
+            uint32_t w[33] = {0}; /* the word before the row, then the row */
             if (g > 0 && S % L) {
                 uint32_t q[4];
                 block(s.key.w, 8u * ((uint64_t)g - 1u) + 7u, s.K - 1u, q);
-                w[0] = q[1];
-                w[1] = q[2];
-                w[2] = q[3];
+                w[0] = q[3];
             }
             uint32_t j1 = (uint32_t)(s.r1 - row < s.K - 1u ? s.r1 - row : s.K - 1u);
             for (uint32_t j = 0; j <= j1; j++) {
                 R.step();
-                R.store(w + 3);
+                R.store(w + 1);
                 uint64_t r = row + j, base = 32u * r;
                 uint64_t lo = base + 1u > S + L ? base + 1u : S + L;
-                uint64_t rem = (lo - S) % L;
-                uint64_t t0 = rem ? lo + (L - rem) : lo;
+                uint64_t t0 = (lo - S) % L ? lo + 1u : lo;
                 if (t0 <= base + 32u && r >= s.r0) {
-                    O u[32], z[32];
+                    float u[32], z[32];
                     unsigned m = 0;
                     uint64_t first = (t0 - S) / L - 1u;
                     for (uint64_t t = t0; t <= base + 32u && first + m < pairs; t += L, m++) {
-                        const uint32_t *v = w + (t - L - base + 3u);
-                        if constexpr (L == 4) {
-                            u[2 * m] = to_f64(v[0] | ((uint64_t)v[1] << 32));
-                            u[2 * m + 1] = to_f64(v[2] | ((uint64_t)v[3] << 32));
-                        } else {
-                            u[2 * m] = to_f32(v[0]);
-                            u[2 * m + 1] = to_f32(v[1]);
-                        }
+                        const uint32_t *v = w + (t - L - base + 1u);
+                        u[2 * m] = to_f32(v[0]);
+                        u[2 * m + 1] = to_f32(v[1]);
                     }
-                    if constexpr (L == 4)
-                        normal_block_f64(u, z, m);
-                    else
-                        normal_block_f32(u, z, m);
+                    normal_block_f32(u, z, m);
                     for (unsigned q = 0; q < 2 * m; q++)
                         if (2 * first + q < n)
                             out[2 * first + q] = z[q];
                 }
                 w[0] = w[32];
-                w[1] = w[33];
-                w[2] = w[34];
             }
         });
 }
@@ -592,24 +576,30 @@ template <class O, class Exec> void fill_normal_group(const Exec &exec, const Sp
 #pragma GCC diagnostic pop
 #endif
 
-template <class Exec, class O>
-void fill_normal_ptr(const Exec &exec, O *out, uint64_t n, Rng &rng) {
-    constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
-    if (n == 0) /* no draws, so no alignment either */
+/* Double normals take one u64 draw each (normal_f64). An empty fill only aligns the position to
+ * 64, as tandem-c's does. Float normals take a pair of f32 draws per two elements, and an empty
+ * fill leaves the position alone. */
+template <class Exec> void fill_normal_ptr(const Exec &exec, double *out, uint64_t n, Rng &rng) {
+    fill_kind<Exec, norm64>(exec, out, n, rng, is_host<Exec> ? Kernel::Auto : Kernel::Chunk);
+}
+
+template <class Exec> void fill_normal_ptr(const Exec &exec, float *out, uint64_t n, Rng &rng) {
+    constexpr unsigned L = 2u;
+    if (n == 0)
         return;
     uint64_t pairs = (n + 1u) / 2u;
     Span s;
-    plan_span(rng, pairs, 32u * L / 2u, 32u * L, s);
+    plan_span(rng, pairs, 32u, 64u, s);
     s.range = n;
     uint64_t S = s.p0 >> 5, ba = (S + L - 1u) >> 2, bb = (S + pairs * L - 1u) >> 2;
     set_rows(s, ba, bb);
     if constexpr (is_host<Exec>) {
-        fill_normal_group<O>(exec, s, out);
+        fill_normal_group(exec, s, out);
     } else {
         if (S % L)
-            fill_normal_chunk<O, true>(exec, s, ba, bb, out);
+            fill_normal_chunk<true>(exec, s, ba, bb, out);
         else
-            fill_normal_chunk<O, false>(exec, s, ba, bb, out);
+            fill_normal_chunk<false>(exec, s, ba, bb, out);
     }
 }
 
@@ -739,12 +729,15 @@ void fill_below(const View &view, Rng &rng, typename View::non_const_value_type 
     exec.fence("tandem::fill_below: fence after the fill");
 }
 
-/* Standard normals in a float or double View by Box-Muller, the flattened sequence of
- * Rng::normalf2 or Rng::normal2 calls: pair j, the elements 2j and 2j + 1 with the cos half
- * first, is made from the draws 2j and 2j + 1 of the f32 or f64 fill. An odd count drops the
- * last sin half and still consumes both draws, so the fill takes 64 (float) or 128 (double)
- * bits per pair. An empty fill leaves the position alone. Specification Appendix A. Double
- * normals and host float normals equal tandem-c bit for bit. CUDA float normals take the fast
+/* Standard normals in a float or double View, specification Appendix A.
+ * double: the 1024-layer ziggurat, the sequence of Rng::normal calls. Element i comes from u64
+ * draw i, and a draw outside the inner rectangles continues on a fallback stream keyed by its
+ * global draw index, so a fill cut anywhere equals the whole fill. An empty fill aligns the
+ * position to 64. Bit for bit equal to tandem-c on every backend.
+ * float: Box-Muller, the flattened sequence of Rng::normalf2 calls: pair j, the elements 2j and
+ * 2j + 1 with the cos half first, comes from the draws 2j and 2j + 1 of the f32 fill. An odd
+ * count drops the last sin half and still consumes both draws. An empty fill leaves the position
+ * alone. Host float normals equal tandem-c bit for bit. CUDA float normals take the fast
  * __sincosf and agree to 16 ulps + 1e-6. */
 template <class Exec, class View> void fill_normal(const Exec &exec, const View &view, Rng &rng) {
     using E = typename View::non_const_value_type;

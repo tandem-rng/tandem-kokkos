@@ -644,57 +644,78 @@ static std::vector<E> device_normal(const Key &key, uint64_t pos, uint32_t K, si
     return std::vector<E>(host.data(), host.data() + n);
 }
 
-// The flattened normal2 calls: an odd count drops the last sin half and still consumes both
-// draws.
-template <class E> static std::vector<E> sequential_normals(Rng &r, size_t n) {
-    std::vector<E> z(n);
-    for (size_t i = 0; i < n; i += 2) {
-        auto pair = [&] {
-            if constexpr (std::is_same_v<E, double>)
-                return r.normal2();
-            else
-                return r.normalf2();
-        }();
-        z[i] = pair.z0;
-        if (i + 1 < n)
-            z[i + 1] = pair.z1;
-    }
-    return z;
+// Host copy of a double normal fill with an explicit kernel.
+template <class Exec>
+static std::vector<double> device_normal64(const Key &key, uint64_t pos, uint32_t K, size_t n,
+                                           Kernel kernel, size_t shift, uint64_t *end) {
+    Kokkos::View<double *, typename Exec::memory_space> buf("normal64", n + 4);
+    auto out = Kokkos::subview(buf, Kokkos::pair<size_t, size_t>(shift, shift + n));
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill_kind<Exec, tandem::detail::norm64>(Exec(), out.data(), n, r, kernel);
+    Exec().fence();
+    *end = r.position();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), out);
+    return std::vector<double>(host.data(), host.data() + n);
 }
 
-template <class Exec, class E> static void check_normal(const char *label) {
+// A double fill equals the Rng::normal calls bit for bit with every kernel, and takes one u64
+// draw per element from the start aligned to 64.
+template <class Exec> static void check_normal64() {
     for (const Trial &t : trials(42, 24)) {
         Rng r = Rng::from_key(t.key, t.pos, t.K);
-        std::vector<E> want = sequential_normals<E>(r, t.n);
+        std::vector<double> want(t.n);
+        for (double &x : want)
+            x = r.normal();
+        for (Kernel kernel : kernels<Exec>()) {
+            uint64_t end;
+            auto got = device_normal64<Exec>(t.key, t.pos, t.K, t.n, kernel, t.shift, &end);
+            bool ok = std::memcmp(want.data(), got.data(), t.n * sizeof(double)) == 0;
+            CHECK(ok);
+            CHECK(end == tandem::align_pos(t.pos, 64) + 64 * t.n);
+            if (!ok)
+                std::printf("  f64 normal %s (K=%u pos=%llu n=%zu shift=%zu)\n", name(kernel),
+                            t.K, (unsigned long long)t.pos, t.n, t.shift);
+        }
+    }
+}
+
+// A float fill equals the flattened normalf2 calls: an odd count drops the last sin half and
+// still consumes both draws.
+template <class Exec> static void check_normal32() {
+    for (const Trial &t : trials(42, 24)) {
+        Rng r = Rng::from_key(t.key, t.pos, t.K);
+        std::vector<float> want(t.n);
+        for (size_t i = 0; i < t.n; i += 2) {
+            auto pair = r.normalf2();
+            want[i] = pair.z0;
+            if (i + 1 < t.n)
+                want[i + 1] = pair.z1;
+        }
         uint64_t end;
-        auto got = device_normal<Exec, E>(t.key, t.pos, t.K, t.n, t.shift, &end);
+        auto got = device_normal<Exec, float>(t.key, t.pos, t.K, t.n, t.shift, &end);
         bool ok = true;
         for (size_t i = 0; i < t.n; i++)
             ok = ok && same_normal<Exec>(got[i], want[i]);
         CHECK(ok);
         CHECK(end == r.position());
         if (!ok)
-            std::printf("  %s normal (K=%u pos=%llu n=%zu shift=%zu)\n", label, t.K,
+            std::printf("  f32 normal (K=%u pos=%llu n=%zu shift=%zu)\n", t.K,
                         (unsigned long long)t.pos, t.n, t.shift);
     }
 }
 
-// Fixtures from tandem-cuda at positions that put the first pair at an even and an odd draw,
-// with an odd count, and empty fills, which leave the position alone.
+// Fixtures from tandem-cuda and tandem-c, a cut fill across fallback draws, and empty fills.
 template <class Exec> static void test_normal() {
-    check_normal<Exec, double>("f64");
-    check_normal<Exec, float>("f32");
+    check_normal64<Exec>();
+    check_normal32<Exec>();
 
     CHECK(words_equal(CROSS_FILL_KEY, Rng(42).key().w));
     const Key k42 = Rng(42).key();
     for (const auto &f : CROSS_NORMAL64) {
         uint64_t end;
         auto v = device_normal<Exec, double>(k42, f.pos, 32, f.n, 0, &end);
-        bool ok = true;
-        for (unsigned i = 0; i < f.n; i++)
-            ok = ok && same_normal<Exec>(v[i], f.out[i]);
-        CHECK(ok);
-        CHECK(end == tandem::align_pos(f.pos, 64) + 128 * ((f.n + 1) / 2));
+        CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0);
+        CHECK(end == tandem::align_pos(f.pos, 64) + 64 * f.n);
     }
     for (const auto &f : CROSS_NORMAL32) {
         uint64_t end;
@@ -706,22 +727,35 @@ template <class Exec> static void test_normal() {
         CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
     }
 
-    // tandem-c's pair fixtures, after one Bool draw.
-    constexpr size_t m = 2 * CROSS_NORMAL_COUNT;
+    // tandem-c's ziggurat rows, with wedge and tail draws in the last rows, and its float
+    // pairs after one Bool draw.
     uint64_t end;
-    auto d = device_normal<Exec, double>(k42, 1, 32, m, 0, &end);
-    bool ok = end == CROSS_NORMAL_END_POS;
-    for (size_t i = 0; i < m; i++)
-        ok = ok && same_normal<Exec>(d[i], CROSS_NORMAL[i]);
-    CHECK(ok);
+    for (const auto &row : CROSS_NORMAL) {
+        auto d = device_normal<Exec, double>(k42, row.start, 32, CROSS_NORMAL_COUNT, 0, &end);
+        CHECK(std::memcmp(d.data(), row.want, sizeof row.want) == 0 && end == row.end_pos);
+    }
+    constexpr size_t m = 2 * CROSS_NORMAL_COUNT;
     auto f = device_normal<Exec, float>(k42, 1, 32, m, 0, &end);
-    ok = end == CROSS_NORMALF_END_POS;
+    bool ok = end == CROSS_NORMALF_END_POS;
     for (size_t i = 0; i < m; i++)
         ok = ok && same_normal<Exec>(f[i], CROSS_NORMALF[i]);
     CHECK(ok);
 
+    // About 13 of 3000 draws leave the inner rectangles for their fallback stream.
+    Kokkos::View<double *, typename Exec::memory_space> whole("whole", 3000), cut("cut", 3000);
+    Rng a = Rng::from_key(k42, 12345, 32), b = a;
+    tandem::fill_normal(Exec(), whole, a);
+    tandem::fill_normal(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(0, 1001)), b);
+    tandem::fill_normal(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(1001, 3000)), b);
+    Exec().fence();
+    auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), whole);
+    auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), cut);
+    CHECK(std::memcmp(hw.data(), hc.data(), 3000 * sizeof(double)) == 0);
+    CHECK(a.position() == b.position());
+
+    // An empty double fill aligns the position to 64, as tandem-c's does. A float one keeps it.
     device_normal<Exec, double>(k42, 1, 32, 0, 0, &end);
-    CHECK(end == 1);
+    CHECK(end == 64);
     device_normal<Exec, float>(k42, 1, 32, 0, 0, &end);
     CHECK(end == 1);
     Kokkos::View<uint32_t *, typename Exec::memory_space> none("none", 0);
@@ -730,29 +764,61 @@ template <class Exec> static void test_normal() {
     CHECK(r.position() == 1);
 }
 
-// The hash tandem-c's tools/dump_normals and tandem-cuda's host_core.cpp print for the same fills:
-// one bit pattern on every compiler and port.
+// The hashes of tandem-c's tests/test_normal_bits.c: 1e6 doubles from each of five starts on
+// every backend, and 2e6 - 1 floats on host backends, where they are exact too.
 template <class Exec> static void test_normal_bits() {
-    if constexpr (tandem::detail::is_host<Exec>) {
-        constexpr size_t n = 2 * 1000000 - 1;
-        uint64_t h = 0xcbf29ce484222325ull;
-        auto fnv = [&h](const void *p, size_t bytes) {
-            for (size_t i = 0; i < bytes; i++)
-                h = (h ^ static_cast<const unsigned char *>(p)[i]) * 0x100000001b3ull;
-        };
-        Kokkos::View<double *, typename Exec::memory_space> d("d", n);
-        Kokkos::View<float *, typename Exec::memory_space> f("f", n);
-        for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
-            Rng r(2026, 7, 0);
+    auto fnv = [](uint64_t h, const void *p, size_t bytes) {
+        for (size_t i = 0; i < bytes; i++)
+            h = (h ^ static_cast<const unsigned char *>(p)[i]) * 0x100000001b3ull;
+        return h;
+    };
+    constexpr size_t nd = 1000000, nf = 2 * 1000000 - 1;
+    uint64_t hd = 0xcbf29ce484222325ull, hf = hd;
+    Kokkos::View<double *, typename Exec::memory_space> d("d", nd);
+    Kokkos::View<float *, typename Exec::memory_space> f("f", nf);
+    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
+        Rng r(2026, 7, 0);
+        r.set_position(start);
+        tandem::fill_normal(Exec(), d, r);
+        auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
+        hd = fnv(hd, h.data(), nd * sizeof(double));
+        if constexpr (tandem::detail::is_host<Exec>) {
             r.set_position(start);
-            tandem::fill_normal(Exec(), d, r);
             tandem::fill_normal(Exec(), f, r);
             Exec().fence();
-            fnv(d.data(), n * sizeof(double));
-            fnv(f.data(), n * sizeof(float));
+            hf = fnv(hf, f.data(), nf * sizeof(float));
         }
-        CHECK(h == 0x9414e1315e2653beull);
     }
+    CHECK(hd == 0xa61cfa844c85f7c1ull);
+    if constexpr (tandem::detail::is_host<Exec>)
+        CHECK(hf == 0xaa1ea656ce73a4fbull);
+}
+
+// N(0, 1) on 1e7 draws: raw moments 0, 1, 0, 3 within five standard errors, and the
+// Kolmogorov-Smirnov distance below its p = 0.001 critical value 1.95 / sqrt(n).
+template <class E> static void test_normal_law() {
+    constexpr size_t n = 10000000;
+    Kokkos::View<E *, Kokkos::HostSpace> v("v", n);
+    Rng r(2026, 10, 5);
+    tandem::fill_normal(Kokkos::DefaultHostExecutionSpace(), v, r);
+    Kokkos::fence();
+    std::vector<double> x(v.data(), v.data() + n);
+    double m[4] = {0, 0, 0, 0};
+    for (double z : x) {
+        double p = z;
+        for (int k = 0; k < 4; k++, p *= z)
+            m[k] += p;
+    }
+    const double want[4] = {0, 1, 0, 3}, var[4] = {1, 2, 15, 96};
+    for (int k = 0; k < 4; k++)
+        CHECK(std::abs(m[k] / n - want[k]) < 5 * std::sqrt(var[k] / n));
+    std::sort(x.begin(), x.end());
+    double ks = 0;
+    for (size_t i = 0; i < n; i++) {
+        double F = 0.5 * std::erfc(-x[i] / std::sqrt(2.0));
+        ks = std::max(ks, std::max(F - (double)i / n, (double)(i + 1) / n - F));
+    }
+    CHECK(ks < 1.95 / std::sqrt((double)n));
 }
 
 // ---- Exponential fills ----------------------------------------------------------------------
@@ -1080,6 +1146,8 @@ int main(int argc, char **argv) {
     run<Kokkos::Serial>("Serial", dir);
     test_exponential_law<double>();
     test_exponential_law<float>();
+    test_normal_law<double>();
+    test_normal_law<float>();
 #ifdef KOKKOS_ENABLE_OPENMP
     run<Kokkos::OpenMP>("OpenMP", dir);
     compare_with_serial<Kokkos::OpenMP>("OpenMP");
