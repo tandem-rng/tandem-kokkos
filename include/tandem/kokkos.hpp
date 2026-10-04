@@ -343,22 +343,69 @@ void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rn
         fill_with<Kind, false>(exec, s, out, kernel);
 }
 
+/* The float Box-Muller step. On CUDA the angle goes through the fast __sincosf, which is accurate
+ * only on [-pi, pi], so the angle is shifted by half a turn and both halves change sign. With
+ * the precise logf and sqrtf this keeps the result within 16 ulps + 1e-6 of box_muller2_f32 and
+ * makes the fill memory bound. Define TANDEM_PRECISE_F32_NORMAL for the precise step. */
+KOKKOS_FORCEINLINE_FUNCTION Pair2<float> normal_step_f32(float a, float b) {
+#if defined(__CUDA_ARCH__) && !defined(TANDEM_PRECISE_F32_NORMAL)
+    float r = sqrtf(-2.0f * logf(1.0f - a)), s, c;
+    __sincosf(6.2831853071795864769f * (b - 0.5f), &s, &c);
+    return Pair2<float>{-r * c, -r * s};
+#else
+    return box_muller2_f32(a, b);
+#endif
+}
+
+/* The normal pair of the uniforms in the words v: two Float64 draws (four words) or two Float32
+ * draws (two words). */
+template <class O> KOKKOS_FORCEINLINE_FUNCTION Pair2<O> normal_pair(const uint32_t *v) {
+    if constexpr (std::is_same_v<O, double>)
+        return box_muller2(to_f64(v[0] | ((uint64_t)v[1] << 32)),
+                           to_f64(v[2] | ((uint64_t)v[3] << 32)));
+    else
+        return normal_step_f32(to_f32(v[0]), to_f32(v[1]));
+}
+
+/* Elements 2i and 2i + 1 of an n-element fill. `wide` says the pair sits at a 2 sizeof(O)
+ * aligned address. */
+template <class O>
+KOKKOS_FORCEINLINE_FUNCTION void store_pair(O *dst, bool wide, uint64_t n, uint64_t i,
+                                            Pair2<O> z) {
+    if (2 * i + 1 >= n) {
+        dst[2 * i] = z.z0;
+    } else if (wide) {
+        struct alignas(2 * sizeof(O)) Two {
+            O v[2];
+        } two = {{z.z0, z.z1}};
+        *reinterpret_cast<Two *>(dst + 2 * i) = two;
+    } else {
+        dst[2 * i] = z.z0;
+        dst[2 * i + 1] = z.z1;
+    }
+}
+
 /* Normal fill by Box-Muller pairs: pair j, the elements 2j and 2j + 1, comes from the L = 2
  * (float) or 4 (double) 32-bit stream slots that start at slot S + j L, S being the first slot
  * of the fill, with the cos half first. A work item owns the blocks that hold the last slot of
- * a pair. s.range is the element count, which an odd count leaves one past the last pair. With S % L != 0 an element can start in the
+ * a pair. s.range is the element count, which an odd count leaves one past the last pair. A
+ * pair goes out as one 16-byte (double) or 8-byte (float) store when the output allows it, and
+ * two float pairs of one block as one 16-byte store when the fill starts on a block. With S % L != 0 an element can start in the
  * previous block, so the item also steps the chunk of that block, which for lane 0 is lane 7
  * one step back, or at step 0 the previous group's last chunk. */
 template <class O, bool STRADDLE, class Exec>
 void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb, O *out) {
     constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
     const uint64_t S = s.p0 >> 5, pairs = (s.p1 - s.p0) / (32u * L), n = s.range;
+    const bool wide = (reinterpret_cast<uintptr_t>(out) & (2 * sizeof(O) - 1)) == 0;
+    const bool quad = !STRADDLE && L == 2 && (S & 3u) == 0 &&
+                      (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
     Kokkos::parallel_for(
         "tandem::fill_normal",
         Kokkos::RangePolicy<Exec, Kokkos::IndexType<int64_t>>(exec, 0,
                                                               (int64_t)(8u * (s.g1 - s.g0 + 1u))),
         KOKKOS_LAMBDA(int64_t t) {
-            O *const dst = out; /* nvcc cannot first-capture `out` inside a constexpr if */
+            O *const dst = out;
             uint64_t c = 8u * s.g0 + (uint64_t)t, g = c >> 3, lane = c & 7u, row = g * s.K;
             uint32_t o[4], h[4], po[4] = {0, 0, 0, 0}, ph[4] = {0, 0, 0, 0};
             F_keyed(s.key.w, c, DOMAIN_STREAM, AUX_STREAM, o, h);
@@ -373,35 +420,46 @@ void fill_normal_chunk(const Exec &exec, const Span s, uint64_t ba, uint64_t bb,
                 uint64_t b = (row + j) * 8u + lane;
                 if (j < j0 || b < ba || b > bb)
                     continue;
-                uint32_t x[8] = {0, 0, 0, 0, o[0], o[1], o[2], o[3]};
-                if (STRADDLE) {
-                    uint32_t q[4] = {0, 0, 0, 0};
-                    const uint32_t *prev = po;
-                    if (lane == 0 && j == 0) {
-                        if (g > 0)
-                            block(s.key.w, 8u * (g - 1u) + 7u, s.K - 1u, q);
-                        prev = q;
-                    }
-                    for (unsigned k = 0; k < 4; k++)
-                        x[k] = prev[k];
+                                if (quad && 4u * (b - ba) + 4u <= n) {
+                    Pair2<float> z0 = normal_step_f32(to_f32(o[0]), to_f32(o[1]));
+                    Pair2<float> z1 = normal_step_f32(to_f32(o[2]), to_f32(o[3]));
+                    struct alignas(16) Quad {
+                        float v[4];
+                    } q4 = {{z0.z0, z0.z1, z1.z0, z1.z1}};
+                    *reinterpret_cast<Quad *>(dst + 4u * (b - ba)) = q4;
+                    continue;
                 }
+                if (!STRADDLE) {
+                    /* S % L == 0: the pairs of the block end at its halves (float) or its end
+                     * (double), and lie inside it. */
+                    for (unsigned m = L == 2 ? 1u : 3u; m < 4; m += L) {
+                        uint64_t last = 4u * b + m + 1u; /* one past the pair's last slot */
+                        if (last < S + L)
+                            continue;
+                        uint64_t i = (last - S) / L - 1u;
+                        if (i < pairs)
+                            store_pair<O>(dst, wide, n, i, normal_pair<O>(o + (m + 1u - L)));
+                    }
+                    continue;
+                }
+                /* Pairs can start in the previous block: x holds it, then this one. */
+                uint32_t x[8] = {0, 0, 0, 0, o[0], o[1], o[2], o[3]};
+                uint32_t q[4] = {0, 0, 0, 0};
+                const uint32_t *prev = po;
+                if (lane == 0 && j == 0) {
+                    if (g > 0)
+                        block(s.key.w, 8u * (g - 1u) + 7u, s.K - 1u, q);
+                    prev = q;
+                }
+                for (unsigned k = 0; k < 4; k++)
+                    x[k] = prev[k];
                 for (unsigned m = 0; m < 4; m++) {
-                    uint64_t last = 4u * b + m + 1u; /* one past the element's last slot */
+                    uint64_t last = 4u * b + m + 1u;
                     if (last < S + L || (last - S) % L)
                         continue;
                     uint64_t i = (last - S) / L - 1u;
-                    if (i >= pairs)
-                        continue;
-                    const uint32_t *v = x + (m + 5u - L);
-                    Pair2<O> z;
-                    if constexpr (L == 4)
-                        z = box_muller2(to_f64(v[0] | ((uint64_t)v[1] << 32)),
-                                        to_f64(v[2] | ((uint64_t)v[3] << 32)));
-                    else
-                        z = box_muller2_f32(to_f32(v[0]), to_f32(v[1]));
-                    dst[2 * i] = z.z0;
-                    if (2 * i + 1 < n)
-                        dst[2 * i + 1] = z.z1;
+                    if (i < pairs)
+                        store_pair<O>(dst, wide, n, i, normal_pair<O>(x + (m + 5u - L)));
                 }
             }
         });

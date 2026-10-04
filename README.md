@@ -156,7 +156,7 @@ the bounded and normal draws. Bounded fills are checked against the contract in 
 written out on host generators, against the sequential `urand(range)` calls, and against
 fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
 scalar `normal2()` calls from random positions and counts, odd and even, and against fixtures from tandem-cuda
-(`cross_fill_normal.h`, 16 ulps plus 1e-6 for float, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
+(`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: 16 ulps plus 1e-6 for float on CUDA, 8 ulps on host spaces, 1e-12 relative for double). It also checks 8- and 16-bit, signed, Float16, `half_t` and complex
 fills against the stream dumps and the u32 stream, and Views of rank 0 to 3 in both layouts. Every non-Serial backend must then write the bytes Serial writes.
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`, and CI fails when it is out of date. CI runs the tests on Linux (GCC)
@@ -211,13 +211,13 @@ with range 1000:
 | `fill_below`, `uint32_t` | 2^28 | 1342 |
 | `fill_below`, `uint64_t` | 2^26 | 1285 |
 | `fill_below`, `uint64_t` | 2^28 | 1320 |
-| `fill_normal`, `float` | 2^26 | 630 |
-| `fill_normal`, `float` | 2^28 | 634 |
-| `fill_normal`, `double` | 2^26 | 613 |
-| `fill_normal`, `double` | 2^28 | 624 |
+| `fill_normal`, `float` | 2^26 | 1086 |
+| `fill_normal`, `float` | 2^28 | 1115 |
+| `fill_normal`, `double` | 2^26 | 683 |
+| `fill_normal`, `double` | 2^28 | 683 |
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
-fill of the same width. A normal pair costs a logarithm, a square root, a sine and a cosine and two
+fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. A normal pair costs a logarithm, a square root, a sine and a cosine and two
 draws. The `uint8_t` fill writes one byte per draw and the 2^26 case runs 15% below 2^28.
 
 Timing every fill alone with its own fence lowers the 2^26 figures by up to 3.2% and the 2^28

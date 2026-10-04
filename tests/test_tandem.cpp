@@ -13,6 +13,7 @@
 
 #include "../external/tandem-cuda/tests/cross_fill_below.h"
 #include "../external/tandem-cuda/tests/cross_fill_normal.h"
+#include "cross_normal.h"
 #include "vectors.hpp"
 
 using tandem::Key;
@@ -599,11 +600,11 @@ template <class Exec> static void test_below() {
 // Normals agree across libms to a few ulps. Host spaces share the host's libm. The host takes
 // the angle 2 pi b rounded, so near a zero of cos or sin it is off by about 1e-15 in absolute
 // terms from the device's sincospi, which the absolute floor covers.
-template <class E> static bool near_normal(E got, E want) {
+template <class E> static bool near_normal(E got, E want, float ulps = 16.0f) {
     if constexpr (std::is_same_v<E, double>)
         return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-14;
     else
-        return std::abs(got - want) <= 16.0f * 0x1p-23f * std::abs(want) + 1e-6f;
+        return std::abs(got - want) <= ulps * 0x1p-23f * std::abs(want) + 1e-6f;
 }
 
 template <class Exec, class E>
@@ -638,7 +639,6 @@ template <class E> static std::vector<E> sequential_normals(Rng &r, size_t n) {
 }
 
 template <class Exec, class E> static void check_normal(const char *label) {
-    constexpr bool host = tandem::detail::is_host<Exec>;
     for (const Trial &t : trials(42, 24)) {
         Rng r = Rng::from_key(t.key, t.pos, t.K);
         std::vector<E> want = sequential_normals<E>(r, t.n);
@@ -646,10 +646,7 @@ template <class Exec, class E> static void check_normal(const char *label) {
         auto got = device_normal<Exec, E>(t.key, t.pos, t.K, t.n, t.shift, &end);
         bool ok = true;
         for (size_t i = 0; i < t.n; i++)
-            ok = ok && (host ? got[i] == want[i] : near_normal(got[i], want[i]));
-        for (size_t i = 0; i < t.n && !ok; i++)
-            if (!near_normal(got[i], want[i]))
-                std::printf("  i=%zu got %.17g want %.17g\n", i, (double)got[i], (double)want[i]);
+            ok = ok && near_normal(got[i], want[i]);
         CHECK(ok);
         CHECK(end == r.position());
         if (!ok)
@@ -685,7 +682,20 @@ template <class Exec> static void test_normal() {
         CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
     }
 
+    // tandem-c's pair fixtures, after one Bool draw. Host spaces agree with its libm to 8 ulps.
+    constexpr size_t m = 2 * CROSS_NORMAL_COUNT;
     uint64_t end;
+    auto d = device_normal<Exec, double>(k42, 1, 32, m, 0, &end);
+    bool ok = end == CROSS_NORMAL_END_POS;
+    for (size_t i = 0; i < m; i++)
+        ok = ok && near_normal(d[i], CROSS_NORMAL[i]);
+    CHECK(ok);
+    auto f = device_normal<Exec, float>(k42, 1, 32, m, 0, &end);
+    ok = end == CROSS_NORMALF_END_POS;
+    for (size_t i = 0; i < m; i++)
+        ok = ok && near_normal(f[i], CROSS_NORMALF[i], tandem::detail::is_host<Exec> ? 8.0f : 16.0f);
+    CHECK(ok);
+
     device_normal<Exec, double>(k42, 1, 32, 0, 0, &end);
     CHECK(end == 1);
     device_normal<Exec, float>(k42, 1, 32, 0, 0, &end);
