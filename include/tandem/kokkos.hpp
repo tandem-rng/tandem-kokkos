@@ -576,11 +576,111 @@ template <class Exec> void fill_normal_group(const Exec &exec, const Span s, flo
 #pragma GCC diagnostic pop
 #endif
 
+/* Double normal fill on devices. One thread steps one chunk, 32 groups per team as in the tile
+ * kernel, and stores the ziggurat's fast path. A miss, 0.43 % of draws, goes to a queue in team
+ * scratch memory, and every NORMAL_STEPS steps the team continues the queued misses together.
+ * Keeping the slow path out of the stepping loop keeps the loop's registers free: with the slow
+ * call inline the fill ran at 506 GiB/s on an A100. A full queue makes the team redo the steps
+ * from the saved chunk states with the slow path inline. */
+constexpr unsigned NORMAL_QUEUE = 256, NORMAL_STEPS = 8; /* about 18 misses per 8 steps */
+
+template <class Exec> void fill_normal64_team(const Exec &exec, const Span s, double *out) {
+    using Policy = Kokkos::TeamPolicy<Exec, Kokkos::LaunchBounds<TILE_THREADS>>;
+    const uint64_t groups = s.g1 - s.g0 + 1u, d0 = s.p0 >> 6;
+    const bool aligned = ((reinterpret_cast<uintptr_t>(out) - s.p0 / 8) & 15u) == 0;
+    Policy policy(exec, (int)((groups + TILE_GROUPS - 1) / TILE_GROUPS), (int)TILE_THREADS);
+    Kokkos::parallel_for(
+        "tandem::fill_normal (f64)",
+        policy.set_scratch_size(0, Kokkos::PerTeam(NORMAL_QUEUE * 16 + 64)),
+        KOKKOS_LAMBDA(const typename Policy::member_type &team) {
+            uint64_t *queue = static_cast<uint64_t *>(
+                team.team_shmem().get_shmem_aligned(NORMAL_QUEUE * 16, 16));
+            unsigned *count = static_cast<unsigned *>(team.team_shmem().get_shmem_aligned(16, 16));
+            uint64_t gb = s.g0 + (uint64_t)team.league_rank() * TILE_GROUPS;
+            unsigned rank = (unsigned)team.team_rank(), lane = rank & 7u;
+            uint64_t g = gb + (rank >> 3);
+            bool mine = g <= s.g1;
+            uint32_t o[4], h[4];
+            F_keyed(s.key.w, 8u * g + lane, DOMAIN_STREAM, AUX_STREAM, o, h);
+            for (uint32_t jb = 0; jb < s.K; jb += NORMAL_STEPS) {
+                if ((gb * s.K + jb) * 1024u >= s.p1)
+                    break;
+                const uint32_t steps = s.K - jb < NORMAL_STEPS ? s.K - jb : NORMAL_STEPS;
+                uint32_t so[4] = {o[0], o[1], o[2], o[3]}, sh[4] = {h[0], h[1], h[2], h[3]};
+                if (rank == 0)
+                    *count = 0;
+                team.team_barrier();
+                for (uint32_t j = 0; j < steps; j++) {
+                    T(o, h);
+                    uint64_t P = (g * s.K + jb + j) * 1024u + lane * 128u;
+                    if (!mine || P + 128u <= s.p0 || P >= s.p1)
+                        continue;
+                    uint64_t r[2] = {o[0] | ((uint64_t)o[1] << 32), o[2] | ((uint64_t)o[3] << 32)};
+                    bool hit[2];
+                    double z[2] = {normal_f64_fast(r[0], hit[0]), normal_f64_fast(r[1], hit[1])};
+                    if (aligned && P >= s.p0 && P + 128u <= s.p1) {
+                        struct alignas(16) Two {
+                            double v[2];
+                        } two = {{z[0], z[1]}};
+                        *reinterpret_cast<Two *>(out + (P - s.p0) / 64u) = two;
+                    }
+                    for (unsigned k = 0; k < 2; k++) {
+                        uint64_t q = P + 64u * k;
+                        if (q < s.p0 || q >= s.p1)
+                            continue;
+                        uint64_t e = (q - s.p0) / 64u;
+                        if (!aligned || P < s.p0 || P + 128u > s.p1)
+                            out[e] = z[k];
+                        if (!hit[k]) {
+                            unsigned at = Kokkos::atomic_fetch_add(count, 1u);
+                            if (at < NORMAL_QUEUE) {
+                                queue[2 * at] = e;
+                                queue[2 * at + 1] = r[k];
+                            }
+                        }
+                    }
+                }
+                team.team_barrier();
+                const unsigned c = *count;
+                if (c <= NORMAL_QUEUE) {
+                    for (unsigned i = rank; i < c; i += TILE_THREADS)
+                        out[queue[2 * i]] =
+                            normal_f64_slow(queue[2 * i + 1], s.key.w, s.K, d0 + queue[2 * i]);
+                } else if (mine) {
+                    for (unsigned k = 0; k < 4; k++) {
+                        o[k] = so[k];
+                        h[k] = sh[k];
+                    }
+                    for (uint32_t j = 0; j < steps; j++) {
+                        T(o, h);
+                        uint64_t P = (g * s.K + jb + j) * 1024u + lane * 128u;
+                        for (unsigned k = 0; k < 2; k++) {
+                            uint64_t q = P + 64u * k;
+                            if (q >= s.p0 && q < s.p1)
+                                out[(q - s.p0) / 64u] =
+                                    normal_f64(o[2 * k] | ((uint64_t)o[2 * k + 1] << 32), s.key.w,
+                                               s.K, d0 + (q - s.p0) / 64u);
+                        }
+                    }
+                }
+                team.team_barrier();
+            }
+        });
+}
+
 /* Double normals take one u64 draw each (normal_f64). An empty fill only aligns the position to
  * 64, as tandem-c's does. Float normals take a pair of f32 draws per two elements, and an empty
  * fill leaves the position alone. */
 template <class Exec> void fill_normal_ptr(const Exec &exec, double *out, uint64_t n, Rng &rng) {
-    fill_kind<Exec, norm64>(exec, out, n, rng, is_host<Exec> ? Kernel::Auto : Kernel::Chunk);
+    if constexpr (is_host<Exec>) {
+        fill_kind<Exec, norm64>(exec, out, n, rng, Kernel::Auto);
+    } else {
+        Span s;
+        if (!plan_span(rng, n, 64u, 64u, s))
+            return;
+        set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
+        fill_normal64_team(exec, s, out);
+    }
 }
 
 template <class Exec> void fill_normal_ptr(const Exec &exec, float *out, uint64_t n, Rng &rng) {

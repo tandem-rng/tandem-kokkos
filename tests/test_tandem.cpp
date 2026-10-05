@@ -676,6 +676,11 @@ template <class Exec> static void check_normal64() {
                 std::printf("  f64 normal %s (K=%u pos=%llu n=%zu shift=%zu)\n", name(kernel),
                             t.K, (unsigned long long)t.pos, t.n, t.shift);
         }
+        // fill_normal itself, which on devices queues the misses in a team kernel.
+        uint64_t end;
+        auto got = device_normal<Exec, double>(t.key, t.pos, t.K, t.n, t.shift, &end);
+        CHECK(std::memcmp(want.data(), got.data(), t.n * sizeof(double)) == 0);
+        CHECK(end == tandem::align_pos(t.pos, 64) + 64 * t.n);
     }
 }
 
