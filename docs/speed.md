@@ -48,10 +48,10 @@ The other fills on the same GPU:
 | `fill_below`, `uint32_t` | 2^28 | 1342 |
 | `fill_below`, `uint64_t` | 2^26 | 1309 |
 | `fill_below`, `uint64_t` | 2^28 | 1328 |
-| `fill_normal`, `float` | 2^26 | 1096 |
-| `fill_normal`, `float` | 2^28 | 1099 |
-| `fill_normal`, `double` | 2^26 | 819 |
-| `fill_normal`, `double` | 2^28 | 815 |
+| `fill_normal`, `float` | 2^26 | 1056 |
+| `fill_normal`, `float` | 2^28 | 1076 |
+| `fill_normal`, `double` | 2^26 | 987 |
+| `fill_normal`, `double` | 2^28 | 1009 |
 | `fill_exponential`, `float` | 2^26 | 1020 |
 | `fill_exponential`, `float` | 2^28 | 1023 |
 | `fill_exponential`, `double` | 2^26 | 892 |
@@ -60,7 +60,7 @@ The other fills on the same GPU:
 `fill_below` uses range 1000.
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
-fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. The CUDA normal fills run below tandem-cuda's own kernels on the same GPU (1099 and 815 GiB/s against 1270 and 833 at 2^28), a known gap with no further tuning planned. The exponential fills run the chunk kernel on devices, because the log makes them compute bound and the tile kernel's write phase then costs more than it gains: 1023 and 908 GiB/s at 2^28, against 1022 and 948 for tandem-cuda. A normal pair costs a logarithm, a square root, a sine and a cosine and two
+fill of the same width. On CUDA the float normal takes the angle through `__sincosf` (shifted by half a turn, within 16 ulps + 1e-6 of the precise step), and a pair or two pairs of one block leave as one 8 or 16-byte store when the output is aligned. The double normal fill is the ziggurat: a team stores the fast path and continues the misses, 0.43 % of draws, from a scratch queue every eight steps. With the slow path inline in the stepping loop it ran at 511 GiB/s. The CUDA normal fills run below tandem-cuda's own kernels on the same GPU (1076 and 1009 GiB/s against 1290 and 1065 to 1096 at 2^28). The exponential fills run the chunk kernel on devices, because the log makes them compute bound and the tile kernel's write phase then costs more than it gains: 1023 and 908 GiB/s at 2^28, against 1022 and 948 for tandem-cuda. A float normal pair costs a logarithm, a square root, a sine and a cosine and two
 draws. The `uint8_t` fill writes one byte per draw and the 2^26 case runs 15% below 2^28.
 
 Timing every fill alone with its own fence lowers the 2^26 figures by up to 3.2% and the 2^28

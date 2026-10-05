@@ -38,7 +38,7 @@ target_link_libraries(app PRIVATE tandem::kokkos)
 
 Without CMake, add `include/` and `external/tandem-cuda/include/` to the include path of a
 Kokkos build. The headers need C++20, as Kokkos 5 does. `external/tandem-cuda` is a
-submodule pinned at c5c5725.
+submodule pinned at 76eddae.
 
 `pixi.toml` provides Kokkos 5.2.1, the newest conda-forge build, with the Serial and OpenMP
 backends (`pixi run test`), built with clang. The latest release is 5.2.2. `pixi run -e gcc test-gcc` builds

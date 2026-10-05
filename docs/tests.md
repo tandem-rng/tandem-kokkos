@@ -13,7 +13,7 @@ pixi run -e cuda test-cuda            # Serial, OpenMP and CUDA on a GPU host
 - Every vector of the specification, from `tests/vectors.hpp`, made by `tools/gen_vectors.py`.
 - Stream dumps from tandem-c in `tests/data` for every type, plus random keys, positions and cuts.
 - Bounded, normal and exponential fills against the fixtures of tandem-cuda and tandem-c.
-- Exponentials: the moments and a Kolmogorov-Smirnov test of Exp(1) on 1e7 draws.
+- Normals and exponentials: the moments and a Kolmogorov-Smirnov test of N(0, 1) and Exp(1) on 1e7 draws.
 - Every backend writes the bytes Serial writes.
 
 `tests/test_tandem.cpp` runs every check on each enabled backend: Serial, OpenMP and CUDA. It
@@ -24,10 +24,15 @@ alignments, checks that fills split at arbitrary points with host draws between 
 one stream, checks mixed-width draws, random access, derived keys and fork positions, and checks
 the bounded and normal draws. Bounded fills are checked against the contract in `core.hpp`
 written out on host generators, against the sequential `urand(range)` calls, against a fill cut in two, and against
-fixtures from tandem-cuda that include rejected draws. Normal fills are checked against the
-scalar `normal2()` calls from random positions and counts, odd and even, on host spaces bit for bit, against the shared hash of 1e6-pair fills at five starts (the one tandem-c's `dump_normals` and tandem-cuda's `host_core.cpp` produce), and against fixtures from tandem-cuda
-(`cross_fill_normal.h` from tandem-cuda and `cross_normal.h` from tandem-c: bit for bit, except
-float on CUDA at 16 ulps plus 1e-6). Exponential fills are checked against the scalar
+fixtures from tandem-cuda that include rejected draws. Double normal fills are checked against
+the scalar `normal()` calls from random positions, counts and chunk lengths with every kernel
+and through `fill_normal` itself, against a fill cut across fallback draws, against tandem-c's
+f64 hash `a61cfa844c85f7c1` of 1e6 doubles at five starts on every backend, and against an
+empty fill's alignment to 64. Float normal fills are checked against the `normalf2()` calls and
+tandem-c's f32 hash `aa1ea656ce73a4fb` on host backends. Both are checked against fixtures from
+tandem-cuda and tandem-c (`cross_fill_normal.h` and `cross_normal.h`: bit for bit, except float
+on CUDA at 16 ulps plus 1e-6), and 1e7 draws of each have the moments and a Kolmogorov-Smirnov
+statistic of N(0, 1). Exponential fills are checked against the scalar
 `exponential()` calls with every kernel, against `cross_fill_exponential.h` from tandem-cuda and
 the hash of tandem-c's `tests/test_exponential_bits.c` on every backend, against a fill cut in
 two, and for the raw moments 1, 2, 6, 24 and a Kolmogorov-Smirnov test of Exp(1) on 1e7 draws. It also checks 8- and 16-bit, signed, Float16, `half_t` and complex

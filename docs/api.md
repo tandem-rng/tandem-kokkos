@@ -45,12 +45,15 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
   position over the width plus `i`. A fill without rejections equals the sequential
   `urand(range)` calls, a fill cut at any element equals the whole fill, and the rare rejection
   costs no coordination.
-- `tandem::fill_normal(view, rng)`: standard normals in a `float` or `double` View by
-  Box-Muller, the flattened sequence of `Rng::normalf2` or `Rng::normal2` calls. Pair `j`, the
-  elements `2j` and `2j + 1` with the cos half first, comes from the draws `2j` and `2j + 1` of
-  the Float32 (Float64) fill, one work item per pair. An odd count drops the last sin half and
-  still consumes both draws, 64 (128) bits per pair. An empty fill leaves the position alone.
-  Both fills have `exec` forms like `fill`.
+- `tandem::fill_normal(view, rng)`: standard normals in a `float` or `double` View. Doubles use
+  the 1024-layer ziggurat of Appendix A, the sequence of `Rng::normal` calls: element `i` comes
+  from draw `i` of the u64 fill, and a draw outside the inner rectangles, 0.43 % of them,
+  continues on a fallback stream keyed by its global draw index, so a fill cut at any element
+  equals the whole fill. An empty double fill aligns the position to 64. Floats use Box-Muller,
+  the flattened sequence of `Rng::normalf2` calls: pair `j`, the elements `2j` and `2j + 1`
+  with the cos half first, comes from the draws `2j` and `2j + 1` of the Float32 fill. An odd
+  count drops the last sin half and still consumes both draws, and an empty float fill leaves
+  the position alone. Both fills have `exec` forms like `fill`.
 - `tandem::fill_exponential(view, rng)`: standard exponentials `-log(1 - u)` in a `float` or
   `double` View, the sequence of `Rng::exponentialf` or `Rng::exponential` calls. Element `i`
   comes from draw `i` of the Float32 (Float64) fill, so the fill consumes `n` draws. An empty fill
@@ -70,8 +73,9 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 | `bit()`, `urand()`, `urand64()`, `frand()`, `drand()` | the specification's Bool, UInt32, UInt64, Float32 and Float64 draws |
 | `at_urand(i)`, `at_urand64(i)`, `at_frand(i)`, `at_drand(i)` | element `i` of the fill that would start here, without advancing |
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
-| `normal()`, `normalf()`, `normal(mean, sd)` | the cos half of a Box-Muller step from two Float64 or Float32 draws |
-| `normal2()`, `normalf2()` | both halves of the step as a pair `z0`, `z1` |
+| `normal()`, `normal(mean, sd)` | a ziggurat normal from one UInt64 draw |
+| `normal2()` | two ziggurat normals from two UInt64 draws, as a pair `z0`, `z1` |
+| `normalf()`, `normalf2()` | the cos half, or both halves, of a Box-Muller step from two Float32 draws |
 | `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |

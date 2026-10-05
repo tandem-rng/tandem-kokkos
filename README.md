@@ -10,7 +10,7 @@
 a noncryptographic random number generator. It writes the specification's stream bit for bit
 on every Kokkos backend, fast on CPUs and GPUs. Two headers, C++20, no compiled library.
 
-Needs C++20 and Kokkos 5. The submodule `external/tandem-cuda` is pinned at c5c5725.
+Needs C++20 and Kokkos 5. The submodule `external/tandem-cuda` is pinned at 76eddae.
 
 ```sh
 git clone --recurse-submodules https://github.com/tandem-rng/tandem-kokkos
