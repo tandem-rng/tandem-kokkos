@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -887,7 +888,7 @@ template <class Exec> static void test_ranks() {
 
 // ---- Conformance cases of the specification ------------------------------------------------
 
-// One case of below.json, fill_below.json, normal.json or exponential.json.
+// One case of below.json, fill_below.json, normal.json, exponential.json or choice.json.
 struct Case {
     std::string id, kind;
     Key key;
@@ -897,6 +898,9 @@ struct Case {
     std::vector<uint64_t> values;
     double ulps = 0, abs = 0; // the tolerance of Float32 normals and exponentials
     unsigned rejected = 0;
+    std::vector<double> weights;
+    uint64_t capacity = 0;
+    std::vector<uint64_t> cut, alias; // where the case pins the whole table
 };
 
 static std::vector<Case> read_cases(const std::string &dir, const char *file) {
@@ -921,6 +925,17 @@ static std::vector<Case> read_cases(const std::string &dir, const char *file) {
         }
         if (const Json *r = j.find("rejected"))
             c.rejected = (unsigned)r->u64();
+        if (const Json *ws = j.find("weights"))
+            for (const Json &x : ws->items)
+                c.weights.push_back(std::bit_cast<double>(x.hex()));
+        if (const Json *cap = j.find("capacity"))
+            c.capacity = cap->hex();
+        if (const Json *cut = j.find("cut")) {
+            for (const Json &x : cut->items)
+                c.cut.push_back(x.hex());
+            for (const Json &x : j["alias"].items)
+                c.alias.push_back(x.hex());
+        }
         // Where the source pins no end: one draw per element, a pair per two Float32 normals.
         const uint64_t p0 = tandem::align_pos(c.start, c.w);
         if (const Json *e = j.find("end"))
@@ -994,6 +1009,27 @@ template <class Exec, class E, class F> static std::vector<uint64_t> case_values
     return v;
 }
 
+// The alias table of a case's weights, built on the host, with its arrays copied to Exec's
+// memory space.
+template <class Exec> struct DeviceTable {
+    std::vector<uint64_t> cut;
+    std::vector<uint32_t> alias;
+    tandem::ChoiceTable host{}, dev{};
+    bool built;
+    Kokkos::View<uint64_t *, typename Exec::memory_space> dcut;
+    Kokkos::View<uint32_t *, typename Exec::memory_space> dalias;
+    explicit DeviceTable(const std::vector<double> &weights)
+        : cut(weights.size()), alias(weights.size()),
+          built(tandem::choice_build(host, weights.data(), weights.size(), cut.data(),
+                                     alias.data())),
+          dcut("cut", cut.size()), dalias("alias", alias.size()) {
+        Kokkos::deep_copy(dcut, Kokkos::View<uint64_t *, Kokkos::HostSpace>(cut.data(), cut.size()));
+        Kokkos::deep_copy(dalias,
+                          Kokkos::View<uint32_t *, Kokkos::HostSpace>(alias.data(), alias.size()));
+        dev = tandem::ChoiceTable{host.capacity, dcut.data(), dalias.data(), host.m};
+    }
+};
+
 // n elements of the case's fill from r on Exec by one path, as bit patterns. An empty fill takes
 // the public fill, which owns the position rule of an empty fill.
 template <class Exec>
@@ -1002,6 +1038,15 @@ static std::vector<uint64_t> fill_case(const Case &c, Rng &r, uint64_t n, Kernel
     const Exec exec;
     const bool pub = kernel == Kernel::Auto || n == 0;
     const std::string &k = c.kind;
+    if (k == "fill_choice") {
+        const DeviceTable<Exec> t(c.weights);
+        return case_values<Exec, uint32_t>(n, [&](auto out) {
+            if (pub)
+                tandem::fill_choice(exec, out, r, t.dev);
+            else
+                td::fill_kind<Exec, td::choice_idx>(exec, out.data(), n, r, kernel, 0, t.dev);
+        });
+    }
     auto below = [&](auto out) {
         using E = typename decltype(out)::non_const_value_type;
         using Kind = std::conditional_t<sizeof(E) == 4, td::below32, td::below64>;
@@ -1079,10 +1124,13 @@ static void check_shift(const std::vector<Case> &cases, const char *a, const cha
     CHECK(ok);
 }
 
-enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32 };
+enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32, choice };
 
-KOKKOS_INLINE_FUNCTION uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range) {
+KOKKOS_INLINE_FUNCTION uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range,
+                                            const tandem::ChoiceTable &t) {
     switch (s) {
+    case Scalar::choice:
+        return r.choice(t);
     case Scalar::below_u32:
         return r.urand((uint32_t)range);
     case Scalar::below_u64:
@@ -1103,10 +1151,12 @@ KOKKOS_INLINE_FUNCTION uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range) {
 template <class Exec> static void check_scalars(const Case &c, Scalar s, uint64_t n, uint64_t end) {
     Case head = c;
     head.values.resize(n);
+    const DeviceTable<Exec> table(c.weights);
+    const tandem::ChoiceTable dev_table = table.dev;
     Rng r = Rng::from_key(c.key, c.start, c.K);
     std::vector<uint64_t> host(n);
     for (uint64_t &v : host)
-        v = scalar_draw(r, s, c.range);
+        v = scalar_draw(r, s, c.range, table.host);
     Kokkos::View<uint64_t *, typename Exec::memory_space> d("scalars", n + 1);
     const Key key = c.key;
     const uint64_t start = c.start, range = c.range;
@@ -1115,7 +1165,7 @@ template <class Exec> static void check_scalars(const Case &c, Scalar s, uint64_
         Kokkos::RangePolicy<Exec>(0, 1), KOKKOS_LAMBDA(int) {
             Rng g = Rng::from_key(key, start, K);
             for (uint64_t i = 0; i < n; i++)
-                d(i) = scalar_draw(g, s, range);
+                d(i) = scalar_draw(g, s, range, dev_table);
             d(n) = g.position();
         });
     auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
@@ -1192,6 +1242,59 @@ template <class Exec> static void test_cases(const std::string &dir) {
     check_shift<Exec>(normal, "CROSS_NORMAL32[2]", "CROSS_NORMAL32[0]", 2);
     check_shift<Exec>(normal, "CROSS_NORMAL32[1]", "CROSS_NORMALF", 0);
     check_range0_and_empty<Exec>();
+}
+
+// ---- Weighted choice ------------------------------------------------------------------------
+
+// Every kernel equals the host's choice() calls at random keys, chunk lengths, positions,
+// lengths and output alignments.
+template <class Exec> static void check_choice_draws(const DeviceTable<Exec> &t) {
+    for (const Trial &tr : trials(57, 12)) {
+        Rng r = Rng::from_key(tr.key, tr.pos, tr.K);
+        std::vector<uint32_t> want(tr.n);
+        for (uint32_t &x : want)
+            x = r.choice(t.host);
+        for (Kernel kernel : kernels<Exec>()) {
+            Kokkos::View<uint32_t *, typename Exec::memory_space> buf("choice", tr.n + 4);
+            Rng g = Rng::from_key(tr.key, tr.pos, tr.K);
+            tandem::detail::fill_kind<Exec, tandem::detail::choice_idx>(
+                Exec(), buf.data() + tr.shift, tr.n, g, kernel, 0, t.dev);
+            Exec().fence();
+            auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), buf);
+            std::vector<uint32_t> got(h.data() + tr.shift, h.data() + tr.shift + tr.n);
+            CHECK(first_diff(want, got) == SIZE_MAX && g.position() == r.position());
+        }
+    }
+}
+
+// Every case's table, whole where the case pins it, fill, cuts and scalar draws, the shift of a
+// later start, fills at any alignment, and the weights that build no table. The case "choice
+// single" has m = 1.
+template <class Exec> static void test_choice(const std::string &dir) {
+    const auto cases = read_cases(dir, "choice.json");
+    size_t tables = 0;
+    for (const Case &c : cases) {
+        const DeviceTable<Exec> t(c.weights);
+        CHECK(t.built && t.host.capacity == c.capacity);
+        if (c.cut.empty())
+            continue;
+        CHECK(t.cut == c.cut &&
+              std::equal(t.alias.begin(), t.alias.end(), c.alias.begin(), c.alias.end()));
+        tables++;
+    }
+    CHECK(tables > 0);
+    check_fill_cases<Exec>(cases);
+    for (const Case &c : cases)
+        if (c.n)
+            check_scalars<Exec>(c, Scalar::choice, c.n, c.end);
+    check_shift<Exec>(cases, "CROSS_CHOICE[1]", "CROSS_CHOICE[0]", 1);
+    check_choice_draws<Exec>(DeviceTable<Exec>(case_named(cases, "choice mixed").weights));
+
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<std::vector<double>> no_table = {{1, -1}, {1, inf}, {nan, 1}, {0, -0.0}, {}};
+    for (const auto &w : no_table)
+        CHECK(!DeviceTable<Exec>(w).built);
 }
 
 // ---- Dumps of hashes.json and position boundaries ------------------------------------------
@@ -1352,6 +1455,7 @@ static void run(const char *space, const std::string &dir, const Json &hashes) {
     test_normal<Exec>();
     test_exponential<Exec>();
     test_cases<Exec>(dir);
+    test_choice<Exec>(dir);
     test_dumps<Exec>(hashes);
     check_complex_straddle<Exec>();
     check_random_access<Exec>();

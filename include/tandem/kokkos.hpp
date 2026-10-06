@@ -30,15 +30,18 @@ struct below64 {};
 struct exp32 {}; /* exponentials over the f32 fill, see exponential_f32 */
 struct exp64 {};
 struct norm64 {}; /* ziggurat normals over the u64 fill, see normal_f64 */
+struct choice_idx {}; /* weighted choice indices of the u64 draws, see choice_of */
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
- * what the bounded kinds need: the fill's key and chunk length, the range, and its rejection
- * threshold, computed once per fill because a division per element cost the A100 a third. */
+ * what the bounded kinds and the choice need: the fill's key and chunk length, the range, its
+ * rejection threshold, computed once per fill because a division per element cost the A100 a
+ * third, and the alias table. */
 struct Span {
     uint64_t p0, p1, r0, r1, g0, g1;
     uint32_t K;
     Key key;
     uint64_t range, thresh;
+    ChoiceTable table;
 };
 
 /* How an output element is made from a block: element k of the block takes bits
@@ -133,6 +136,14 @@ template <> struct elem<norm64> {
                                               const Span &s) {
         return normal_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.key.w, s.K,
                           (s.p0 >> 6) + e);
+    }
+};
+template <> struct elem<choice_idx> {
+    using out_t = uint32_t;
+    static constexpr unsigned bits = 64;
+    KOKKOS_INLINE_FUNCTION static uint32_t make(const uint32_t w[4], unsigned k, uint64_t,
+                                                const Span &s) {
+        return choice_of(s.table, w[2 * k] | ((uint64_t)w[2 * k + 1] << 32));
     }
 };
 template <> struct elem<below32> {
@@ -382,6 +393,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.p0 = p0;
     s.p1 = p0 + n * bits;
     s.range = s.thresh = 0;
+    s.table = ChoiceTable{};
     rng.set_position(s.p1);
     return n != 0;
 }
@@ -396,12 +408,13 @@ inline void set_rows(Span &s, uint64_t ba, uint64_t bb) {
 
 template <class Exec, class Kind>
 void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rng &rng,
-               Kernel kernel, uint64_t range = 0) {
+               Kernel kernel, uint64_t range = 0, const ChoiceTable &table = {}) {
     constexpr unsigned bits = elem<Kind>::bits;
     Span s;
     if (!plan_span(rng, n, bits, bits, s))
         return;
     s.range = range;
+    s.table = table;
     s.thresh = bits == 64 ? below_threshold_u64(range) : below_threshold_u32((uint32_t)range);
     set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
     /* Blocks land on 16-byte addresses when the output's first byte and the fill's first
@@ -831,6 +844,27 @@ void fill_below(const View &view, Rng &rng, typename View::non_const_value_type 
     typename View::execution_space exec;
     fill_below(exec, view, rng, range);
     exec.fence("tandem::fill_below: fence after the fill");
+}
+
+/* Weighted choice indices in a uint32_t View of any rank, specification Appendix C: element i
+ * maps UInt64 draw i of the fill through the alias table, so the fill consumes 64 bits per
+ * element, never retries, equals the Rng::choice calls and is bit identical to tandem-c's
+ * tandem_fill_choice. Build the table with choice_build on the host into arrays that `exec` can
+ * read: host memory for a host space, or host mirrors copied to Views in the device's memory
+ * space, with the table's cut and alias pointing to those Views. An empty fill aligns the
+ * position to 64. */
+template <class Exec, class View>
+void fill_choice(const Exec &exec, const View &view, Rng &rng, const ChoiceTable &table) {
+    static_assert(std::is_same_v<typename View::non_const_value_type, uint32_t>,
+                  "tandem::fill_choice: the value type must be uint32_t");
+    detail::check_view<Exec>(view, "tandem::fill_choice");
+    detail::fill_kind<Exec, detail::choice_idx>(exec, view.data(), view.size(), rng,
+                                                detail::Kernel::Auto, 0, table);
+}
+template <class View> void fill_choice(const View &view, Rng &rng, const ChoiceTable &table) {
+    typename View::execution_space exec;
+    fill_choice(exec, view, rng, table);
+    exec.fence("tandem::fill_choice: fence after the fill");
 }
 
 /* Standard normals in a float or double View, specification Appendix A.
