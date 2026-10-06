@@ -48,7 +48,7 @@ if(TANDEM_TESTS)
             target_compile_options(test_tandem PRIVATE -mfma)
         endif()
     endif()
-    add_test(NAME tandem COMMAND test_tandem ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
+    add_test(NAME tandem COMMAND test_tandem ${CMAKE_CURRENT_SOURCE_DIR}/tests/conformance)
     set_tests_properties(tandem PROPERTIES ENVIRONMENT "OMP_PROC_BIND=false")
 endif()
 

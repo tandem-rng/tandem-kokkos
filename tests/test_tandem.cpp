@@ -1,6 +1,8 @@
-// Spec vectors, reference stream dumps, fills against in-kernel draws, split fills, derived
-// keys, bounded draws, and byte identity across backends, on every enabled execution space.
+// Spec vectors, the spec's conformance files, fills against in-kernel draws, split fills,
+// derived keys, bounded draws, and byte identity across backends, on every enabled execution
+// space.
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -12,10 +14,7 @@
 #include <Kokkos_Random.hpp>
 #include <tandem/kokkos.hpp>
 
-#include "../external/tandem-cuda/tests/cross_fill_below.h"
-#include "../external/tandem-cuda/tests/cross_fill_exponential.h"
-#include "../external/tandem-cuda/tests/cross_fill_normal.h"
-#include "cross_normal.h"
+#include "conformance.hpp"
 #include "vectors.hpp"
 
 using tandem::Key;
@@ -215,69 +214,66 @@ template <class Exec> static void test_vectors() {
         CHECK(su32[v.index] == v.value);
 }
 
-// ---- Dumps --------------------------------------------------------------------------------
+// ---- Stream hashes of hashes.json ---------------------------------------------------------
 
-template <class T> static std::vector<T> slurp(const std::string &dir, const char *file) {
-    std::string path = dir + "/" + file;
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        std::printf("FAIL cannot open %s\n", path.c_str());
-        failures++;
-        return {};
-    }
-    std::fseek(f, 0, SEEK_END);
-    size_t len = (size_t)std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    std::vector<T> v(len / sizeof(T));
-    if (std::fread(v.data(), 1, len, f) != len)
-        failures++;
-    std::fclose(f);
-    return v;
+static Key json_key(const Json &words) {
+    Key k;
+    for (int w = 0; w < 4; w++)
+        k.w[w] = (uint32_t)words.items[w].hex();
+    return k;
 }
 
-template <class Exec, class E>
-static void check_dump_fill(const std::string &dir, const char *file, const Key &key,
-                            uint32_t K) {
-    std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
-    if (want.empty())
-        return;
+template <class T> static std::string sha256_of(const std::vector<T> &v) {
+    return sha256_hex(v.data(), v.size() * sizeof(T));
+}
+
+// The fills of every kernel, and the in-kernel scalar draws of the types that have one, hash to
+// the stream's SHA-256. Float16 as bit patterns, which test_f16 relates to half_t Views.
+template <class Exec, class E> static void check_stream(const Json &s) {
+    const Key key = json_key(s["key"]);
+    const uint32_t K = (uint32_t)s["K"].u64();
+    const uint64_t start = s["start"].u64();
+    const size_t n = s["n"].u64();
+    const std::string &want = s["sha256"].text;
     for (Kernel kernel : kernels<Exec>()) {
-        size_t i = first_diff(want, device_fill<Exec, E>(key, 0, K, want.size(), kernel));
-        CHECK(i == SIZE_MAX);
-        if (i != SIZE_MAX)
-            std::printf("  %s: %s fill differs at %zu\n", file, name(kernel), i);
+        bool ok;
+        if constexpr (std::is_same_v<E, tandem::detail::f16_bits>)
+            ok = sha256_of(device_f16_bits<Exec>(key, start, K, n, kernel)) == want;
+        else
+            ok = sha256_of(device_fill<Exec, E>(key, start, K, n, kernel)) == want;
+        CHECK(ok);
+        if (!ok)
+            std::printf("  %s: %s fill hash differs\n", s["file"].text.c_str(), name(kernel));
     }
+    if constexpr (std::is_same_v<E, bool> || std::is_same_v<E, uint32_t> ||
+                  std::is_same_v<E, uint64_t> || std::is_same_v<E, float> ||
+                  std::is_same_v<E, double>)
+        CHECK(sha256_of(device_draws<Exec, E>(key, start, K, n)) == want);
 }
 
-template <class Exec, class E>
-static void check_dump(const std::string &dir, const char *file, const Key &key, uint32_t K) {
-    check_dump_fill<Exec, E>(dir, file, key, K);
-    std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
-    if (want.empty())
-        return;
-    size_t i = first_diff(want, device_draws<Exec, E>(key, 0, K, want.size()));
-    CHECK(i == SIZE_MAX);
-    if (i != SIZE_MAX)
-        std::printf("  %s: draws differ at %zu\n", file, i);
-}
-
-template <class Exec> static void test_dumps(const std::string &dir) {
-    const uint32_t k1234[4] = {1, 2, 3, 4};
-    const Key k = key_of(k1234), s42 = Rng(42).key();
-    check_dump<Exec, uint32_t>(dir, "k1234_K32_u32.bin", k, 32);
-    check_dump<Exec, uint64_t>(dir, "k1234_K32_u64.bin", k, 32);
-    check_dump<Exec, uint32_t>(dir, "k1234_K8_u32.bin", k, 8);
-    check_dump<Exec, double>(dir, "seed42_K32_f64.bin", s42, 32);
-    check_dump<Exec, float>(dir, "seed42_K32_f32.bin", s42, 32);
-    check_dump<Exec, bool>(dir, "seed42_K32_bool.bin", s42, 32);
-    check_dump_fill<Exec, uint8_t>(dir, "seed42_K32_u8.bin", s42, 32);
-    check_dump_fill<Exec, Kokkos::complex<float>>(dir, "seed42_K32_c32.bin", s42, 32);
-    check_dump_fill<Exec, Kokkos::complex<double>>(dir, "seed42_K32_c64.bin", s42, 32);
-
-    std::vector<uint16_t> f16 = slurp<uint16_t>(dir, "seed42_K32_f16bits.bin");
-    for (Kernel kernel : kernels<Exec>())
-        CHECK(first_diff(f16, device_f16_bits<Exec>(s42, 0, 32, f16.size(), kernel)) ==
-              SIZE_MAX);
+// UInt128 and Char have no fill here.
+template <class Exec> static void test_streams(const Json &hashes) {
+    for (const Json &s : hashes["streams"].items) {
+        const std::string &type = s["type"].text;
+        if (type == "UInt32")
+            check_stream<Exec, uint32_t>(s);
+        else if (type == "UInt64")
+            check_stream<Exec, uint64_t>(s);
+        else if (type == "UInt8")
+            check_stream<Exec, uint8_t>(s);
+        else if (type == "Bool")
+            check_stream<Exec, bool>(s);
+        else if (type == "Float32")
+            check_stream<Exec, float>(s);
+        else if (type == "Float64")
+            check_stream<Exec, double>(s);
+        else if (type == "Float16")
+            check_stream<Exec, tandem::detail::f16_bits>(s);
+        else if (type == "ComplexF32")
+            check_stream<Exec, Kokkos::complex<float>>(s);
+        else if (type == "ComplexF64")
+            check_stream<Exec, Kokkos::complex<double>>(s);
+    }
 }
 
 // ---- Fills against draws at random keys, chunk lengths, positions, lengths, alignments ----
@@ -568,35 +564,10 @@ template <class Exec, class E> static void check_below(const char *label) {
     }
 }
 
-// A fill cut at an arbitrary element boundary equals the whole fill, at a start with
-// rejections: the range 2^31 + 1 rejects about half of the u32 draws.
-template <class Exec, class E> static void check_below_cut() {
-    const Key key = Rng(13).key();
-    constexpr size_t n = 3001;
-    const E range = (E)1 << (8 * sizeof(E) - 1) | 1u;
-    Kokkos::View<E *, typename Exec::memory_space> whole("whole", n), a("a", 1234), b("b", n - 1234);
-    Rng r = Rng::from_key(key, 77, 32), w = r;
-    tandem::fill_below(Exec(), whole, w, range);
-    tandem::fill_below(Exec(), a, r, range);
-    tandem::fill_below(Exec(), b, r, range);
-    Exec().fence();
-    auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), whole);
-    auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
-    auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), b);
-    bool same = r.position() == w.position();
-    for (size_t i = 0; i < n; i++)
-        same = same && hw(i) == (i < 1234 ? ha(i) : hb(i - 1234));
-    CHECK(same);
-}
-
-// Without a rejection a bounded fill equals the sequential urand(range) calls, and fixtures from
-// tandem-cuda pin the fallback stream: 41 of the 2^31 + 1 elements and 34 of the 2^63 + 1
-// elements reject.
+// Without a rejection a bounded fill equals the sequential urand(range) calls.
 template <class Exec> static void test_below() {
     check_below<Exec, uint32_t>("u32");
     check_below<Exec, uint64_t>("u64");
-    check_below_cut<Exec, uint32_t>();
-    check_below_cut<Exec, uint64_t>();
 
     const Key key = Rng(11).key();
     uint64_t end0;
@@ -607,20 +578,6 @@ template <class Exec> static void test_below() {
     for (uint32_t v : got)
         same = same && v == r.urand(1000u);
     CHECK(same);
-
-    CHECK(words_equal(CROSS_FILL_KEY, Rng(42).key().w));
-    const Key k42 = Rng(42).key();
-    for (Kernel kernel : kernels<Exec>()) {
-        uint64_t end;
-        for (const auto &f : CROSS_BELOW32) {
-            auto v = device_below<Exec, uint32_t>(k42, 0, 32, 64, f.range, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 && end == 64 * 32);
-        }
-        for (const auto &f : CROSS_BELOW64) {
-            auto v = device_below<Exec, uint64_t>(k42, 0, 32, 64, f.range, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 && end == 64 * 64);
-        }
-    }
 }
 
 // Host normals and every double normal run core.hpp's explicit-fma polynomials and equal
@@ -709,94 +666,9 @@ template <class Exec> static void check_normal32() {
     }
 }
 
-// Fixtures from tandem-cuda and tandem-c, a cut fill across fallback draws, and empty fills.
 template <class Exec> static void test_normal() {
     check_normal64<Exec>();
     check_normal32<Exec>();
-
-    CHECK(words_equal(CROSS_FILL_KEY, Rng(42).key().w));
-    const Key k42 = Rng(42).key();
-    for (const auto &f : CROSS_NORMAL64) {
-        uint64_t end;
-        auto v = device_normal<Exec, double>(k42, f.pos, 32, f.n, 0, &end);
-        CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0);
-        CHECK(end == tandem::align_pos(f.pos, 64) + 64 * f.n);
-    }
-    for (const auto &f : CROSS_NORMAL32) {
-        uint64_t end;
-        auto v = device_normal<Exec, float>(k42, f.pos, 32, f.n, 0, &end);
-        bool ok = true;
-        for (unsigned i = 0; i < f.n; i++)
-            ok = ok && same_normal<Exec>(v[i], f.out[i]);
-        CHECK(ok);
-        CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
-    }
-
-    // tandem-c's ziggurat rows, with wedge and tail draws in the last rows, and its float
-    // pairs after one Bool draw.
-    uint64_t end;
-    for (const auto &row : CROSS_NORMAL) {
-        auto d = device_normal<Exec, double>(k42, row.start, 32, CROSS_NORMAL_COUNT, 0, &end);
-        CHECK(std::memcmp(d.data(), row.want, sizeof row.want) == 0 && end == row.end_pos);
-    }
-    constexpr size_t m = 2 * CROSS_NORMAL_COUNT;
-    auto f = device_normal<Exec, float>(k42, 1, 32, m, 0, &end);
-    bool ok = end == CROSS_NORMALF_END_POS;
-    for (size_t i = 0; i < m; i++)
-        ok = ok && same_normal<Exec>(f[i], CROSS_NORMALF[i]);
-    CHECK(ok);
-
-    // About 13 of 3000 draws leave the inner rectangles for their fallback stream.
-    Kokkos::View<double *, typename Exec::memory_space> whole("whole", 3000), cut("cut", 3000);
-    Rng a = Rng::from_key(k42, 12345, 32), b = a;
-    tandem::fill_normal(Exec(), whole, a);
-    tandem::fill_normal(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(0, 1001)), b);
-    tandem::fill_normal(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(1001, 3000)), b);
-    Exec().fence();
-    auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), whole);
-    auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), cut);
-    CHECK(std::memcmp(hw.data(), hc.data(), 3000 * sizeof(double)) == 0);
-    CHECK(a.position() == b.position());
-
-    // An empty double fill aligns the position to 64, as tandem-c's does. A float one keeps it.
-    device_normal<Exec, double>(k42, 1, 32, 0, 0, &end);
-    CHECK(end == 64);
-    device_normal<Exec, float>(k42, 1, 32, 0, 0, &end);
-    CHECK(end == 1);
-    Kokkos::View<uint32_t *, typename Exec::memory_space> none("none", 0);
-    Rng r = Rng::from_key(k42, 1, 32);
-    tandem::fill_below(Exec(), none, r, 7u);
-    CHECK(r.position() == 1);
-}
-
-// The hashes of tandem-c's tests/test_normal_bits.c: 1e6 doubles from each of five starts on
-// every backend, and 2e6 - 1 floats on host backends, where they are exact too.
-template <class Exec> static void test_normal_bits() {
-    auto fnv = [](uint64_t h, const void *p, size_t bytes) {
-        for (size_t i = 0; i < bytes; i++)
-            h = (h ^ static_cast<const unsigned char *>(p)[i]) * 0x100000001b3ull;
-        return h;
-    };
-    constexpr size_t nd = 1000000, nf = 2 * 1000000 - 1;
-    uint64_t hd = 0xcbf29ce484222325ull, hf = hd;
-    Kokkos::View<double *, typename Exec::memory_space> d("d", nd);
-    Kokkos::View<float *, typename Exec::memory_space> f("f", nf);
-    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
-        Rng r(2026, 7, 0);
-        r.set_position(start);
-        tandem::fill_normal(Exec(), d, r);
-        auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
-        hd = fnv(hd, h.data(), nd * sizeof(double));
-        if constexpr (tandem::detail::is_host<Exec>) {
-            r.set_position(start);
-            tandem::fill_normal(Exec(), f, r);
-            Exec().fence();
-            hf = fnv(hf, f.data(), nf * sizeof(float));
-        }
-    }
-    CHECK(hd == 0xa61cfa844c85f7c1ull);
-    if constexpr (tandem::detail::is_host<Exec>)
-        CHECK(hf == 0xaa1ea656ce73a4fbull);
 }
 
 // N(0, 1) on 1e7 draws: raw moments 0, 1, 0, 3 within five standard errors, and the
@@ -866,59 +738,9 @@ template <class Exec, class E> static void check_exponential(const char *label) 
     }
 }
 
-// tandem-cuda's fixtures and the hash of tandem-c's tests/test_exponential_bits.c, on every
-// backend. A fill cut in two equals the whole fill, and an empty fill keeps the position.
 template <class Exec> static void test_exponential() {
     check_exponential<Exec, double>("f64");
     check_exponential<Exec, float>("f32");
-
-    const Key k42 = Rng(42).key();
-    for (const auto &f : CROSS_EXP64) {
-        uint64_t end;
-        auto v = device_exponential<Exec, double>(k42, f.pos, 32, f.n, kernels<Exec>()[0], 0, &end);
-        CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0);
-        CHECK(end == tandem::align_pos(f.pos, 64) + 64 * f.n);
-    }
-    for (const auto &f : CROSS_EXP32) {
-        uint64_t end;
-        auto v = device_exponential<Exec, float>(k42, f.pos, 32, f.n, kernels<Exec>()[0], 0, &end);
-        CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(float)) == 0);
-        CHECK(end == tandem::align_pos(f.pos, 32) + 32 * f.n);
-    }
-
-    Kokkos::View<double *, typename Exec::memory_space> whole("whole", 3001), cut("cut", 3001);
-    Rng a = Rng::from_key(k42, 12345, 32), b = a;
-    tandem::fill_exponential(Exec(), whole, a);
-    tandem::fill_exponential(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(0, 1234)), b);
-    tandem::fill_exponential(Exec(), Kokkos::subview(cut, Kokkos::pair<int, int>(1234, 3001)), b);
-    Exec().fence();
-    auto hw = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), whole);
-    auto hc = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), cut);
-    CHECK(std::memcmp(hw.data(), hc.data(), 3001 * sizeof(double)) == 0);
-    CHECK(a.position() == b.position());
-
-    Kokkos::View<float *, typename Exec::memory_space> none("none", 0);
-    Rng r = Rng::from_key(k42, 1, 32);
-    tandem::fill_exponential(Exec(), none, r);
-    CHECK(r.position() == 1);
-
-    constexpr size_t n = 1000000;
-    uint64_t h = 0xcbf29ce484222325ull;
-    Kokkos::View<double *, typename Exec::memory_space> d("d", n);
-    Kokkos::View<float *, typename Exec::memory_space> f("f", n);
-    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
-        Rng g(2026, 7, 0);
-        g.set_position(start);
-        tandem::fill_exponential(Exec(), d, g);
-        auto hd = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
-        tandem::fill_exponential(Exec(), f, g);
-        auto hf = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), f);
-        for (size_t i = 0; i < n * sizeof(double); i++)
-            h = (h ^ reinterpret_cast<const unsigned char *>(hd.data())[i]) * 0x100000001b3ull;
-        for (size_t i = 0; i < n * sizeof(float); i++)
-            h = (h ^ reinterpret_cast<const unsigned char *>(hf.data())[i]) * 0x100000001b3ull;
-    }
-    CHECK(h == 0x47f8f98297d94ee2ull);
 }
 
 // Exp(1) on 1e7 draws: raw moments 1, 2, 6, 24 within five standard errors, and the
@@ -1063,12 +885,451 @@ template <class Exec> static void test_ranks() {
     CHECK(threw);
 }
 
+// ---- Conformance cases of the specification ------------------------------------------------
+
+// One case of below.json, fill_below.json, normal.json or exponential.json.
+struct Case {
+    std::string id, kind;
+    Key key;
+    uint32_t K;
+    unsigned w; // draw width
+    uint64_t start, n, end, range = 0;
+    std::vector<uint64_t> values;
+    double ulps = 0, abs = 0; // the tolerance of Float32 normals and exponentials
+    unsigned rejected = 0;
+};
+
+static std::vector<Case> read_cases(const std::string &dir, const char *file) {
+    const Json cases = read_json(dir + "/" + file);
+    std::vector<Case> out;
+    for (const Json &j : cases["cases"].items) {
+        Case c;
+        c.id = j["id"].text;
+        c.kind = j["kind"].text;
+        c.key = json_key(j["key"]);
+        c.K = (uint32_t)j["K"].u64();
+        c.w = c.kind.ends_with("32") ? 32 : 64;
+        c.start = j["start"].u64();
+        c.n = j["n"].u64();
+        if (const Json *r = j.find("range"))
+            c.range = r->hex();
+        for (const Json &v : j["values"].items)
+            c.values.push_back(v.hex());
+        if (const Json *t = j.find("tol")) {
+            c.ulps = (*t)["ulps"].number();
+            c.abs = (*t)["abs"].number();
+        }
+        if (const Json *r = j.find("rejected"))
+            c.rejected = (unsigned)r->u64();
+        // Where the source pins no end: one draw per element, a pair per two Float32 normals.
+        const uint64_t p0 = tandem::align_pos(c.start, c.w);
+        if (const Json *e = j.find("end"))
+            c.end = e->u64();
+        else
+            c.end = c.kind == "fill_normal_f32" ? p0 + 64 * ((c.n + 1) / 2) : p0 + c.w * c.n;
+        out.push_back(c);
+    }
+    return out;
+}
+
+// The name is a pointer: GCC's dangling-reference warning fires on a std::string temporary.
+static const Case &case_named(const std::vector<Case> &cases, const char *name) {
+    for (const Case &c : cases)
+        if (c.id.ends_with(std::string(" ") + name))
+            return c;
+    throw std::runtime_error(std::string("no conformance case ") + name);
+}
+
+// Bit for bit, except CUDA Float32 normals, which take the fast __sincosf and agree to the
+// case's tolerance |y - x| <= ulps 2^-23 |x| + abs.
+template <class Exec> static bool matches(const Case &c, const std::vector<uint64_t> &got) {
+    if (got.size() != c.values.size())
+        return false;
+    const bool exact = tandem::detail::is_host<Exec> || c.kind != "fill_normal_f32";
+    for (size_t i = 0; i < got.size(); i++) {
+        if (exact) {
+            if (got[i] != c.values[i])
+                return false;
+            continue;
+        }
+        double y = std::bit_cast<float>((uint32_t)got[i]);
+        double x = std::bit_cast<float>((uint32_t)c.values[i]);
+        if (!(std::abs(y - x) <= c.ulps * 0x1p-23 * std::abs(x) + c.abs))
+            return false;
+    }
+    return true;
+}
+
+// The fill paths of a case: Kernel::Auto is the public fill, the others detail::fill_kind with
+// that kernel. Float32 normals have no kernel choice.
+template <class Exec> static std::vector<Kernel> case_paths(const Case &c) {
+    std::vector<Kernel> paths = {Kernel::Auto};
+    if (c.kind != "fill_normal_f32")
+        for (Kernel k : kernels<Exec>())
+            paths.push_back(k);
+    return paths;
+}
+
+template <class E> KOKKOS_INLINE_FUNCTION uint64_t bit_pattern(E x) {
+    using U = std::conditional_t<sizeof(E) == 8, uint64_t, uint32_t>;
+    U u;
+    std::memcpy(&u, &x, sizeof u);
+    return u;
+}
+
+// The first n elements of a View of n + 1 elements of E, written by `fill`, as bit patterns.
+// The last element must keep its sentinel, so a fill writes nothing past its n elements.
+template <class Exec, class E, class F> static std::vector<uint64_t> case_values(uint64_t n, F fill) {
+    Kokkos::View<E *, typename Exec::memory_space> buf("case", n + 1);
+    using U = std::conditional_t<sizeof(E) == 8, uint64_t, uint32_t>;
+    const E sentinel = std::bit_cast<E>(~(U)0);
+    Kokkos::deep_copy(buf, sentinel);
+    fill(Kokkos::subview(buf, Kokkos::pair<size_t, size_t>(0, n)));
+    Exec().fence();
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), buf);
+    CHECK(bit_pattern(h(n)) == bit_pattern(sentinel));
+    std::vector<uint64_t> v(n);
+    for (size_t i = 0; i < n; i++)
+        v[i] = bit_pattern(h(i));
+    return v;
+}
+
+// n elements of the case's fill from r on Exec by one path, as bit patterns. An empty fill takes
+// the public fill, which owns the position rule of an empty fill.
+template <class Exec>
+static std::vector<uint64_t> fill_case(const Case &c, Rng &r, uint64_t n, Kernel kernel) {
+    namespace td = tandem::detail;
+    const Exec exec;
+    const bool pub = kernel == Kernel::Auto || n == 0;
+    const std::string &k = c.kind;
+    auto below = [&](auto out) {
+        using E = typename decltype(out)::non_const_value_type;
+        using Kind = std::conditional_t<sizeof(E) == 4, td::below32, td::below64>;
+        if (pub)
+            tandem::fill_below(exec, out, r, (E)c.range);
+        else
+            td::fill_kind<Exec, Kind>(exec, out.data(), n, r, kernel, c.range);
+    };
+    auto normal = [&](auto out) {
+        if (pub)
+            tandem::fill_normal(exec, out, r);
+        else
+            td::fill_kind<Exec, td::norm64>(exec, out.data(), n, r, kernel);
+    };
+    auto exponential = [&](auto out) {
+        using E = typename decltype(out)::non_const_value_type;
+        using Kind = std::conditional_t<std::is_same_v<E, float>, td::exp32, td::exp64>;
+        if (pub)
+            tandem::fill_exponential(exec, out, r);
+        else
+            td::fill_kind<Exec, Kind>(exec, out.data(), n, r, kernel);
+    };
+    if (k == "fill_below_u32")
+        return case_values<Exec, uint32_t>(n, below);
+    if (k == "fill_below_u64")
+        return case_values<Exec, uint64_t>(n, below);
+    if (k == "fill_normal_f64")
+        return case_values<Exec, double>(n, normal);
+    if (k == "fill_normal_f32")
+        return case_values<Exec, float>(n, [&](auto out) { tandem::fill_normal(exec, out, r); });
+    if (k == "fill_exponential_f64")
+        return case_values<Exec, double>(n, exponential);
+    if (k == "fill_exponential_f32")
+        return case_values<Exec, float>(n, exponential);
+    throw std::runtime_error("no fill for kind " + k);
+}
+
+// Every case on every path: whole, and cut at elements 1, 7, 20, 21 and n - 1 into pieces
+// filled in order on one generator, values and end position. A Float32 normal fill cuts only
+// between pairs, since an odd piece drops its last sin half. The cases hold the fallbacks by
+// global draw index, the empty fills, odd Float32 normal counts and the pair rule.
+template <class Exec> static void check_fill_cases(const std::vector<Case> &cases) {
+    for (const Case &c : cases)
+        for (Kernel path : case_paths<Exec>(c)) {
+            Rng r = Rng::from_key(c.key, c.start, c.K);
+            bool ok = matches<Exec>(c, fill_case<Exec>(c, r, c.n, path)) && r.position() == c.end;
+            const uint64_t cuts[] = {1, 7, 20, 21, c.n - 1};
+            for (uint64_t cut : cuts) {
+                if (c.n == 0 || cut >= c.n || (c.kind == "fill_normal_f32" && cut % 2))
+                    continue;
+                Rng g = Rng::from_key(c.key, c.start, c.K);
+                auto a = fill_case<Exec>(c, g, cut, path);
+                auto b = fill_case<Exec>(c, g, c.n - cut, path);
+                a.insert(a.end(), b.begin(), b.end());
+                ok = ok && matches<Exec>(c, a) && g.position() == c.end;
+            }
+            CHECK(ok);
+            if (!ok)
+                std::printf("  %s (%s) differs\n", c.id.c_str(),
+                            path == Kernel::Auto ? "public" : name(path));
+        }
+}
+
+// Element i of case a equals element i + shift of case b, both filled here.
+template <class Exec>
+static void check_shift(const std::vector<Case> &cases, const char *a, const char *b,
+                        size_t shift) {
+    const Case &ca = case_named(cases, a), &cb = case_named(cases, b);
+    Rng ra = Rng::from_key(ca.key, ca.start, ca.K), rb = Rng::from_key(cb.key, cb.start, cb.K);
+    auto va = fill_case<Exec>(ca, ra, ca.n, Kernel::Auto);
+    auto vb = fill_case<Exec>(cb, rb, cb.n, Kernel::Auto);
+    bool ok = !va.empty();
+    for (size_t i = 0; i < va.size() && i + shift < vb.size(); i++)
+        ok = ok && va[i] == vb[i + shift];
+    CHECK(ok);
+}
+
+enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32 };
+
+KOKKOS_INLINE_FUNCTION uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range) {
+    switch (s) {
+    case Scalar::below_u32:
+        return r.urand((uint32_t)range);
+    case Scalar::below_u64:
+        return r.urand64(range);
+    case Scalar::normal_f64:
+        return bit_pattern(r.normal());
+    case Scalar::normal_f32:
+        return bit_pattern(r.normalf());
+    case Scalar::exp_f64:
+        return bit_pattern(r.exponential());
+    default:
+        return bit_pattern(r.exponentialf());
+    }
+}
+
+// The first n values of a case as n scalar draws on the host and in a kernel on Exec, and the
+// position after them.
+template <class Exec> static void check_scalars(const Case &c, Scalar s, uint64_t n, uint64_t end) {
+    Case head = c;
+    head.values.resize(n);
+    Rng r = Rng::from_key(c.key, c.start, c.K);
+    std::vector<uint64_t> host(n);
+    for (uint64_t &v : host)
+        v = scalar_draw(r, s, c.range);
+    Kokkos::View<uint64_t *, typename Exec::memory_space> d("scalars", n + 1);
+    const Key key = c.key;
+    const uint64_t start = c.start, range = c.range;
+    const uint32_t K = c.K;
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Exec>(0, 1), KOKKOS_LAMBDA(int) {
+            Rng g = Rng::from_key(key, start, K);
+            for (uint64_t i = 0; i < n; i++)
+                d(i) = scalar_draw(g, s, range);
+            d(n) = g.position();
+        });
+    auto h = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), d);
+    std::vector<uint64_t> dev(h.data(), h.data() + n);
+    bool ok = matches<Kokkos::Serial>(head, host) && r.position() == end &&
+              matches<Exec>(head, dev) && h(n) == end;
+    CHECK(ok);
+    if (!ok)
+        std::printf("  %s scalar draws differ\n", c.id.c_str());
+}
+
+// Range 0 gives 0 and consumes one draw of the width that the interface names, and an empty
+// uniform fill aligns the position to its width.
+template <class Exec> static void check_range0_and_empty() {
+    Kokkos::View<uint32_t *, typename Exec::memory_space> u32("u32", 1), none32("none32", 0);
+    Kokkos::View<uint64_t *, typename Exec::memory_space> u64("u64", 1), none64("none64", 0);
+    Kokkos::View<bool *, typename Exec::memory_space> none1("none1", 0);
+    Kokkos::deep_copy(u32, ~0u);
+    Kokkos::deep_copy(u64, ~0ull);
+    Rng r = Rng::from_key(Rng(42).key(), 33, 32);
+    tandem::fill_below(u32, r, 0u);
+    CHECK(Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), u32)(0) == 0 &&
+          r.position() == 96);
+    tandem::fill_below(u64, r, (uint64_t)0);
+    CHECK(Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), u64)(0) == 0 &&
+          r.position() == 192);
+    CHECK(r.urand(0u) == 0 && r.position() == 224);
+    CHECK(r.urand64((uint64_t)0) == 0 && r.position() == 320);
+
+    for (uint64_t pos : {33ull, 65ull}) {
+        Rng g = Rng::from_key(Rng(42).key(), pos, 32);
+        tandem::fill(none32, g);
+        CHECK(g.position() == tandem::align_pos(pos, 32));
+        g.set_position(pos);
+        tandem::fill(none64, g);
+        CHECK(g.position() == tandem::align_pos(pos, 64));
+        g.set_position(pos);
+        tandem::fill(none1, g);
+        CHECK(g.position() == pos);
+    }
+}
+
+template <class Exec> static void test_cases(const std::string &dir) {
+    const auto below = read_cases(dir, "below.json");
+    const auto fill_below = read_cases(dir, "fill_below.json");
+    const auto normal = read_cases(dir, "normal.json");
+    const auto exponential = read_cases(dir, "exponential.json");
+    check_fill_cases<Exec>(fill_below);
+    check_fill_cases<Exec>(normal);
+    check_fill_cases<Exec>(exponential);
+    unsigned rejected = 0;
+    for (const Case &c : fill_below)
+        rejected += c.rejected;
+    CHECK(rejected > 0);
+
+    // Scalar bounded draws retry in sequence. Scalar normals and exponentials equal the fills.
+    for (const Case &c : below)
+        check_scalars<Exec>(c, c.w == 32 ? Scalar::below_u32 : Scalar::below_u64, c.n, c.end);
+    for (const Case &c : normal)
+        if (c.kind == "fill_normal_f64" && c.n)
+            check_scalars<Exec>(c, Scalar::normal_f64, c.n, c.end);
+    for (const Case &c : exponential)
+        if (c.n)
+            check_scalars<Exec>(c, c.w == 64 ? Scalar::exp_f64 : Scalar::exp_f32, c.n, c.end);
+    // A scalar Float32 normal is the cos half of a pair and consumes two draws.
+    const Case &nf = case_named(normal, "CROSS_NORMALF");
+    check_scalars<Exec>(nf, Scalar::normal_f32, 1, tandem::align_pos(nf.start, 32) + 64);
+
+    // A later start shifts the elements: the fallback follows the global draw index, and a
+    // Float32 normal start one pair later shifts the output by one pair.
+    check_shift<Exec>(fill_below, "CROSS_BELOW32_AT[4]", "CROSS_BELOW32[4]", 1);
+    check_shift<Exec>(fill_below, "CROSS_BELOW64_AT[6]", "CROSS_BELOW64[6]", 1);
+    check_shift<Exec>(normal, "CROSS_NORMAL[1]", "CROSS_NORMAL[0]", 1);
+    check_shift<Exec>(normal, "CROSS_NORMAL32[2]", "CROSS_NORMAL32[0]", 2);
+    check_shift<Exec>(normal, "CROSS_NORMAL32[1]", "CROSS_NORMALF", 0);
+    check_range0_and_empty<Exec>();
+}
+
+// ---- Dumps of hashes.json and position boundaries ------------------------------------------
+
+static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
+    const unsigned char *b = static_cast<const unsigned char *>(p);
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+template <class Exec, class E, class F> static uint64_t dump_fill(uint64_t h, size_t n, F fill) {
+    Kokkos::View<E *, typename Exec::memory_space> v(Kokkos::view_alloc("dump", Kokkos::WithoutInitializing), n);
+    fill(v);
+    Exec().fence();
+    auto host = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
+    return fnv1a(h, host.data(), n * sizeof(E));
+}
+
+// The fills of each dump in order on one generator per start. The Float32 normal hash holds for
+// C's polynomials, which host fills take and CUDA's fast __sincosf does not, so that dump runs
+// on host spaces only.
+template <class Exec> static void test_dumps(const Json &hashes) {
+    const Exec exec;
+    for (const Json &dump : hashes["dumps"].items) {
+        const Json &draws = dump["draws"];
+        bool f32_normal = false;
+        for (const Json &d : draws.items)
+            f32_normal = f32_normal || d["kind"].text == "fill_normal_f32";
+        if (f32_normal && !tandem::detail::is_host<Exec>)
+            continue;
+        const Key key = json_key(dump["key"]);
+        uint64_t h = 0xcbf29ce484222325ull, end = 0;
+        for (const Json &start : dump["starts"].items) {
+            Rng r = Rng::from_key(key, start.u64(), (uint32_t)dump["K"].u64());
+            for (const Json &d : draws.items) {
+                const std::string &kind = d["kind"].text;
+                const size_t n = d["n"].u64();
+                if (kind == "fill_normal_f64")
+                    h = dump_fill<Exec, double>(h, n, [&](auto v) { tandem::fill_normal(exec, v, r); });
+                else if (kind == "fill_normal_f32")
+                    h = dump_fill<Exec, float>(h, n, [&](auto v) { tandem::fill_normal(exec, v, r); });
+                else if (kind == "fill_exponential_f64")
+                    h = dump_fill<Exec, double>(h, n, [&](auto v) { tandem::fill_exponential(exec, v, r); });
+                else if (kind == "fill_exponential_f32")
+                    h = dump_fill<Exec, float>(h, n, [&](auto v) { tandem::fill_exponential(exec, v, r); });
+                else
+                    throw std::runtime_error("no fill for dump kind " + kind);
+            }
+            end = r.position();
+        }
+        const Json *want_end = dump.find("end");
+        bool ok = h == dump["fnv1a"].hex() && (!want_end || end == want_end->u64());
+        CHECK(ok);
+        if (!ok)
+            std::printf("  %s: hash %016llx\n", dump["id"].text.c_str(), (unsigned long long)h);
+    }
+}
+
+// A complex value whose real part ends a block takes its imaginary part from the next block.
+template <class Exec> static void check_complex_straddle() {
+    const Key key = Rng(42).key();
+    const Rng at0 = Rng::from_key(key, 0, 32);
+    for (Kernel kernel : kernels<Exec>()) {
+        uint64_t end;
+        auto d = device_fill<Exec, Kokkos::complex<double>>(key, 64, 32, 1, kernel, 0, &end);
+        CHECK(end == 192 && d[0].real() == at0.at_drand(1) && d[0].imag() == at0.at_drand(2));
+        auto f = device_fill<Exec, Kokkos::complex<float>>(key, 96, 32, 1, kernel, 0, &end);
+        CHECK(end == 160 && f[0].real() == at0.at_frand(3) && f[0].imag() == at0.at_frand(4));
+    }
+}
+
+// Random access on the host and in a kernel equals the fill from the same position, from starts
+// on both sides of block, row and chunk boundaries. A chunk at K = 8 is 8192 bits.
+template <class Exec> static void check_random_access() {
+    const Key key = Rng(42).key();
+    constexpr size_t n = 64;
+    for (uint64_t p : {0ull, 100ull, 127ull, 128ull, 1000ull, 1023ull, 1024ull, 6000ull, 8191ull,
+                       8192ull, 8193ull, 16389ull}) {
+        auto u64 = device_fill<Exec, uint64_t>(key, p, 8, n, Kernel::Chunk);
+        auto u32 = device_fill<Exec, uint32_t>(key, p, 8, n, Kernel::Chunk);
+        Kokkos::View<uint64_t *, typename Exec::memory_space> v("at", 2 * n);
+        Kokkos::parallel_for(
+            Kokkos::RangePolicy<Exec>(0, (int64_t)n), KOKKOS_LAMBDA(int64_t i) {
+                const Rng r = Rng::from_key(key, p, 8);
+                v(i) = r.at_urand64((uint64_t)i);
+                v(n + i) = r.at_urand((uint64_t)i);
+            });
+        auto dev = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), v);
+        const Rng r = Rng::from_key(key, p, 8);
+        bool ok = true;
+        for (size_t i = 0; i < n; i++)
+            ok = ok && r.at_urand64(i) == u64[i] && dev(i) == u64[i] && r.at_urand(i) == u32[i] &&
+                 dev(n + i) == u32[i];
+        CHECK(ok);
+    }
+}
+
+// A UInt64 draw at 2^63 - 1 aligns to 2^63, on the host, in a kernel and in a fill. A fill whose
+// end reaches 2^64 throws before it writes or moves the position: its View has 2^57 elements of
+// 64 bits from 2^63, viewed over one element, which the check reads back.
+template <class Exec> static void check_position_bounds() {
+    const Key key = Rng(42).key();
+    const uint64_t top = 1ull << 63;
+    Rng r = Rng::from_key(key, top - 1, 32);
+    const uint64_t x = r.urand64();
+    CHECK(r.position() == top + 64 && x == Rng::from_key(key, top, 32).at_urand64(0));
+    auto draws = device_draws<Exec, uint64_t>(key, top - 1, 32, 1);
+    CHECK(draws[0] == x);
+    for (Kernel kernel : kernels<Exec>()) {
+        uint64_t end;
+        auto v = device_fill<Exec, uint64_t>(key, top - 1, 32, 1, kernel, 0, &end);
+        CHECK(v[0] == x && end == top + 64);
+    }
+
+    Kokkos::View<uint64_t *, typename Exec::memory_space> one("one", 1);
+    Kokkos::deep_copy(one, ~0ull);
+    Kokkos::View<uint64_t *, typename Exec::memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
+        huge(one.data(), (size_t)1 << 57);
+    Rng g = Rng::from_key(key, top - 1, 32);
+    bool threw = false;
+    try {
+        tandem::fill(Exec(), huge, g);
+    } catch (const std::overflow_error &) {
+        threw = true;
+    }
+    Exec().fence();
+    CHECK(threw && g.position() == top - 1 &&
+          Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), one)(0) == ~0ull);
+}
+
 // ---- Backends -----------------------------------------------------------------------------
 
-template <class Exec> static void run(const char *space, const std::string &dir) {
+template <class Exec>
+static void run(const char *space, const std::string &dir, const Json &hashes) {
     long c0 = checks, f0 = failures;
     test_vectors<Exec>();
-    test_dumps<Exec>(dir);
+    test_streams<Exec>(hashes);
     check_against_draws<Exec, uint32_t>("u32");
     check_against_draws<Exec, uint64_t>("u64");
     check_against_draws<Exec, float>("f32");
@@ -1089,8 +1350,12 @@ template <class Exec> static void run(const char *space, const std::string &dir)
     test_ranks<Exec>();
     test_below<Exec>();
     test_normal<Exec>();
-    test_normal_bits<Exec>();
     test_exponential<Exec>();
+    test_cases<Exec>(dir);
+    test_dumps<Exec>(hashes);
+    check_complex_straddle<Exec>();
+    check_random_access<Exec>();
+    check_position_bounds<Exec>();
     std::printf("%s: %ld checks, %ld failures\n", space, checks - c0, failures - f0);
 }
 
@@ -1147,18 +1412,19 @@ template <class Exec> static void compare_with_serial(const char *space) {
 
 int main(int argc, char **argv) {
     Kokkos::ScopeGuard guard(argc, argv);
-    std::string dir = argc > 1 ? argv[argc - 1] : "tests/data";
-    run<Kokkos::Serial>("Serial", dir);
+    const std::string dir = argc > 1 ? argv[argc - 1] : "tests/conformance";
+    const Json hashes = read_json(dir + "/hashes.json");
+    run<Kokkos::Serial>("Serial", dir, hashes);
     test_exponential_law<double>();
     test_exponential_law<float>();
     test_normal_law<double>();
     test_normal_law<float>();
 #ifdef KOKKOS_ENABLE_OPENMP
-    run<Kokkos::OpenMP>("OpenMP", dir);
+    run<Kokkos::OpenMP>("OpenMP", dir, hashes);
     compare_with_serial<Kokkos::OpenMP>("OpenMP");
 #endif
 #ifdef KOKKOS_ENABLE_CUDA
-    run<Kokkos::Cuda>("Cuda", dir);
+    run<Kokkos::Cuda>("Cuda", dir, hashes);
     compare_with_serial<Kokkos::Cuda>("Cuda");
 #endif
     if (failures) {
