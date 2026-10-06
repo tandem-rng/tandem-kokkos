@@ -32,12 +32,13 @@ struct exp64 {};
 struct norm64 {}; /* ziggurat normals over the u64 fill, see normal_f64 */
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
- * what the bounded kinds need: the fill's key and chunk length, and the range. */
+ * what the bounded kinds need: the fill's key and chunk length, the range, and its rejection
+ * threshold, computed once per fill because a division per element cost the A100 a third. */
 struct Span {
     uint64_t p0, p1, r0, r1, g0, g1;
     uint32_t K;
     Key key;
-    uint64_t range;
+    uint64_t range, thresh;
 };
 
 /* How an output element is made from a block: element k of the block takes bits
@@ -139,7 +140,8 @@ template <> struct elem<below32> {
     static constexpr unsigned bits = 32;
     KOKKOS_INLINE_FUNCTION static uint32_t make(const uint32_t w[4], unsigned k, uint64_t e,
                                                 const Span &s) {
-        return below_u32(w[k], (uint32_t)s.range, s.key.w, s.K, (s.p0 >> 5) + e);
+        return below_u32_t(w[k], (uint32_t)s.range, (uint32_t)s.thresh, s.key.w, s.K,
+                           (s.p0 >> 5) + e);
     }
 };
 template <> struct elem<below64> {
@@ -147,8 +149,8 @@ template <> struct elem<below64> {
     static constexpr unsigned bits = 64;
     KOKKOS_INLINE_FUNCTION static uint64_t make(const uint32_t w[4], unsigned k, uint64_t e,
                                                 const Span &s) {
-        return below_u64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.range, s.key.w, s.K,
-                        (s.p0 >> 6) + e);
+        return below_u64_t(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.range, s.thresh, s.key.w,
+                           s.K, (s.p0 >> 6) + e);
     }
 };
 
@@ -379,7 +381,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.key = rng.key();
     s.p0 = p0;
     s.p1 = p0 + n * bits;
-    s.range = 0;
+    s.range = s.thresh = 0;
     rng.set_position(s.p1);
     return n != 0;
 }
@@ -400,6 +402,7 @@ void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rn
     if (!plan_span(rng, n, bits, bits, s))
         return;
     s.range = range;
+    s.thresh = bits == 64 ? below_threshold_u64(range) : below_threshold_u32((uint32_t)range);
     set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
     /* Blocks land on 16-byte addresses when the output's first byte and the fill's first
      * stream byte agree modulo 16. */
