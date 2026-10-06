@@ -29,8 +29,9 @@ to 3 in both layouts. Every non-Serial backend must then write the bytes Serial 
 ## Conformance files
 
 `tests/conformance/*.json` are byte-identical copies of tandem-spec f420545
-`conformance/*.json`, read by `tests/conformance.hpp`. Each item of the spec's
-`conformance/CHECKLIST.md` has its test, run on every backend:
+`conformance/*.json`, read by `tests/conformance.hpp`. The tests follow
+`conformance/CHECKLIST.md` at tandem-spec b31af72, whose JSON files equal f420545's. Each item
+has its test, run on every backend:
 
 | checklist section | test |
 |---|---|
@@ -40,7 +41,7 @@ to 3 in both layouts. Every non-Serial backend must then write the bytes Serial 
 | Odd n | the `CROSS_NORMAL32` cases, values and end |
 | Pair rule for Float32 Box-Muller | `CROSS_NORMALF`, `check_shift` on `CROSS_NORMAL32[1]` and `[2]`, `check_scalars` for `normalf()` |
 | Weighted choice | `test_choice`: every table of `choice.json` (whole where pinned, else `capacity`), every case, `check_shift` on `CROSS_CHOICE[1]`, `check_scalars` for `choice()`, the `n = 0` case, rejected weights; `m = 1` is the `choice single` case |
-| Cut fill | `check_fill_cases` cuts every case of the four fill files at 1, 7, 20, 21 and n − 1, Float32 normals at the even ones; `check_scalars` |
+| Cut fill | `check_fill_cases` cuts every case of the four fill files at 1, 7, 20, 21 and n − 1, Float32 normals at 2, 8, 20 and the largest even element below n; `check_scalars` |
 | Block and 2^63 position boundaries | `test_streams`, `test_dumps`, `check_complex_straddle`, `check_random_access`, `check_position_bounds` |
 
 The fill cases run on every path: the public fill and `detail::fill_kind` with each kernel of
