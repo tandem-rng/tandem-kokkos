@@ -51,7 +51,10 @@ odd element drops that piece's last sin half, so it cuts only between pairs. The
 dump hash holds for C's polynomials, which host fills take and CUDA's `__sincosf` does not, so
 that dump runs on host backends. `hashes.json` has no fill here for its UInt128 and Char
 streams. `Kokkos::rand<tandem::Rng, uint64_t>::draw(rng, range)` calls `urand64(range)`, which
-names the width.
+names the width. `check_position_bounds` checks the start bounds on the host and in kernels, and
+that a fill ending past 2^63 moves the generator there, so the next fill continues the stream.
+The fill that reaches 2^64 has a View of 2^57 elements over one element of memory, since the
+fill throws before it writes.
 
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`.

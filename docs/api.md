@@ -103,7 +103,7 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 | `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
 | `choice(table)` | a weighted choice index from one UInt64 draw |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
-| `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
+| `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form. `set_position` returns false and changes nothing for `p >= 2^63`, and `from_key` with such a start keeps position 0 |
 
 Signed integers hold the two's complement of the unsigned draw of the same width. A complex
 value takes two draws, the real and then the imaginary component. `half_t` needs a Kokkos with a
