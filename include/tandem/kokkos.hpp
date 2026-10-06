@@ -415,11 +415,12 @@ void fill_kind(const Exec &exec, typename elem<Kind>::out_t *out, uint64_t n, Rn
 
 /* The float Box-Muller step. On CUDA the angle goes through the fast __sincosf, which is accurate
  * only on [-pi, pi], so the angle is shifted by half a turn and both halves change sign. With
- * the precise logf and sqrtf this keeps the result within 16 ulps + 1e-6 of box_muller2_f32 and
- * makes the fill memory bound. Define TANDEM_PRECISE_F32_NORMAL for the precise step. */
+ * the precise logf and the IEEE square root without its range check, sqrt_rn_nonneg, this keeps
+ * the result within 16 ulps + 1e-6 of box_muller2_f32. Define TANDEM_PRECISE_F32_NORMAL for the
+ * precise step. */
 KOKKOS_FORCEINLINE_FUNCTION Pair2<float> normal_step_f32(float a, float b) {
 #if defined(__CUDA_ARCH__) && !defined(TANDEM_PRECISE_F32_NORMAL)
-    float r = sqrtf(-2.0f * logf(1.0f - a)), s, c;
+    float r = detail::sqrt_rn_nonneg(-2.0f * logf(1.0f - a)), s, c;
     __sincosf(6.2831853071795864769f * (b - 0.5f), &s, &c);
     return Pair2<float>{-r * c, -r * s};
 #else
