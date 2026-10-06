@@ -1,7 +1,8 @@
 // Fill throughput: tandem::fill with its default kernel and with the chunk kernel, and
 // Kokkos::fill_random with Random_XorShift64_Pool, then the narrow, complex, bounded, normal and
-// exponential fills. Each row: a half-second warm-up, then the
-// minimum over `runs` runs of the time per fill of `batch` back-to-back fills and one fence.
+// exponential fills, and on CUDA cuRAND Philox4x32-10 for each output type. Each row: a
+// half-second warm-up, then the minimum over `runs` runs of the time per fill of `batch`
+// back-to-back fills and one fence.
 // A batch of 1 includes the launch and fence latency in every fill.
 //
 // Usage: bench serial|openmp|cuda [runs] [batch] [log2 n ...]
@@ -14,6 +15,9 @@
 
 #include <Kokkos_Random.hpp>
 #include <tandem/kokkos.hpp>
+#ifdef KOKKOS_ENABLE_CUDA
+#include <curand.h>
+#endif
 
 using tandem::detail::Kernel;
 
@@ -84,6 +88,37 @@ template <class Exec> static void bench_more(int lg) {
         best_seconds(exec, [&] { tandem::fill_exponential(exec, g64, rng); }));
 }
 
+#ifdef KOKKOS_ENABLE_CUDA
+/* cuRAND Philox4x32-10 on the execution space's stream, one row per output type above. cuRAND
+ * has no 8- or 64-bit integer output for Philox, so curandGenerate writes the same bytes as
+ * 32-bit words, and a complex<double> view takes 2n uniform doubles. */
+static void bench_curand(int lg) {
+    Kokkos::Cuda exec;
+    size_t n = (size_t)1 << lg;
+    Kokkos::View<double *, Kokkos::CudaSpace> v("curand", 2 * n);
+    auto u32 = reinterpret_cast<unsigned *>(v.data());
+    auto f32 = reinterpret_cast<float *>(v.data());
+    curandGenerator_t g;
+    curandCreateGenerator(&g, CURAND_RNG_PSEUDO_PHILOX4_32_10);
+    curandSetPseudoRandomGeneratorSeed(g, 42);
+    curandSetStream(g, exec.cuda_stream());
+    auto time = [&](auto &&f) { return best_seconds(exec, f); };
+    row("cuRAND curandGenerate", "u32", lg, 4, time([&] { curandGenerate(g, u32, n); }));
+    row("cuRAND curandGenerate", "u64", lg, 8, time([&] { curandGenerate(g, u32, 2 * n); }));
+    row("cuRAND curandGenerateUniform", "f32", lg, 4, time([&] { curandGenerateUniform(g, f32, n); }));
+    row("cuRAND curandGenerateUniformDouble", "f64", lg, 8,
+        time([&] { curandGenerateUniformDouble(g, v.data(), n); }));
+    row("cuRAND curandGenerate", "u8", lg, 1, time([&] { curandGenerate(g, u32, n / 4); }));
+    row("cuRAND curandGenerateUniformDouble", "c64", lg, 16,
+        time([&] { curandGenerateUniformDouble(g, v.data(), 2 * n); }));
+    row("cuRAND curandGenerateNormal", "f32", lg, 4,
+        time([&] { curandGenerateNormal(g, f32, n, 0.0f, 1.0f); }));
+    row("cuRAND curandGenerateNormalDouble", "f64", lg, 8,
+        time([&] { curandGenerateNormalDouble(g, v.data(), n, 0.0, 1.0); }));
+    curandDestroyGenerator(g);
+}
+#endif
+
 template <class Exec> static void bench(const std::vector<int> &logs) {
     std::printf("%s, concurrency %d, minimum of %d runs, %d fills per run\n", Exec::name(),
                 Exec().concurrency(), runs, batch);
@@ -93,6 +128,10 @@ template <class Exec> static void bench(const std::vector<int> &logs) {
         bench_type<Exec, float>("f32", lg);
         bench_type<Exec, double>("f64", lg);
         bench_more<Exec>(lg);
+#ifdef KOKKOS_ENABLE_CUDA
+        if constexpr (std::is_same_v<Exec, Kokkos::Cuda>)
+            bench_curand(lg);
+#endif
     }
 }
 

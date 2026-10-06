@@ -46,6 +46,7 @@ platforms = ["linux-64"]
 cuda-version = "12.8.*"
 cuda-nvcc = "12.8.*"
 cuda-cudart-dev = "12.8.*"
+libcurand-dev = "*"
 clangxx = "19.*"
 gxx = "14.*"
 git = "*"
