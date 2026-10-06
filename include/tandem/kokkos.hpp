@@ -394,7 +394,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.p1 = p0 + n * bits;
     s.range = s.thresh = 0;
     s.table = ChoiceTable{};
-    rng.set_position(s.p1);
+    rng.advance_to(s.p1); /* the end may lie at or past 2^63, which set_position rejects */
     return n != 0;
 }
 

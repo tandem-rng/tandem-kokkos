@@ -1393,22 +1393,56 @@ template <class Exec> static void check_random_access() {
     }
 }
 
-// A UInt64 draw at 2^63 - 1 aligns to 2^63, on the host, in a kernel and in a fill. A fill whose
-// end reaches 2^64 throws before it writes or moves the position: its View has 2^57 elements of
+// A generator accepts start 2^63 - 1 and rejects 2^63 and 2^64 - 1 without changing state, on
+// the host and in a kernel: set_position returns false, and from_key keeps position 0. A UInt64
+// draw at 2^63 - 1 aligns to 2^63, on the host, in a kernel and in a fill, and a fill that ends
+// past 2^63 moves the generator to its end. A fill whose end reaches 2^64 throws before it writes or moves the position: its View has 2^57 elements of
 // 64 bits from 2^63, viewed over one element, which the check reads back.
 template <class Exec> static void check_position_bounds() {
     const Key key = Rng(42).key();
     const uint64_t top = 1ull << 63;
     Rng r = Rng::from_key(key, top - 1, 32);
+    CHECK(r.position() == top - 1);
     const uint64_t x = r.urand64();
-    CHECK(r.position() == top + 64 && x == Rng::from_key(key, top, 32).at_urand64(0));
-    auto draws = device_draws<Exec, uint64_t>(key, top - 1, 32, 1);
-    CHECK(draws[0] == x);
+    CHECK(r.position() == top + 64 && x == Rng::from_key(key, top - 1, 32).at_urand64(0));
+    Kokkos::View<uint64_t[8], typename Exec::memory_space> k("bounds");
+    Kokkos::parallel_for(
+        Kokkos::RangePolicy<Exec>(0, 1), KOKKOS_LAMBDA(int) {
+            Rng g = Rng::from_key(key, top - 1, 32);
+            k(0) = g.position();
+            k(1) = g.urand64();
+            k(2) = g.position();
+            Rng s = Rng::from_key(key, 5, 32);
+            k(3) = s.set_position(top) || s.set_position(~0ull);
+            k(4) = s.position();
+            k(5) = Rng::from_key(key, top, 32).position();
+            k(6) = Rng::from_key(key, ~0ull, 32).position();
+            k(7) = s.set_position(top - 1) && s.position() == top - 1;
+        });
+    auto hk = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), k);
+    CHECK(hk(0) == top - 1 && hk(1) == x && hk(2) == top + 64);
+    CHECK(hk(3) == 0 && hk(4) == 5 && hk(5) == 0 && hk(6) == 0 && hk(7) == 1);
+    for (uint64_t bad : {top, ~(uint64_t)0}) {
+        Rng s = Rng::from_key(key, 5, 32);
+        CHECK(!s.set_position(bad) && s.position() == 5);
+        CHECK(Rng::from_key(key, bad, 32).position() == 0);
+    }
     for (Kernel kernel : kernels<Exec>()) {
         uint64_t end;
         auto v = device_fill<Exec, uint64_t>(key, top - 1, 32, 1, kernel, 0, &end);
         CHECK(v[0] == x && end == top + 64);
     }
+    // A fill that ends past 2^63 moves the generator there, so the next fill continues the
+    // stream instead of repeating it.
+    Kokkos::View<uint64_t *, typename Exec::memory_space> a("a", 3), b("b", 2);
+    Rng f = Rng::from_key(key, top - 1, 32);
+    tandem::fill(a, f);
+    CHECK(f.position() == top + 192);
+    tandem::fill(b, f);
+    auto ha = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), a);
+    auto hb = Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), b);
+    CHECK(f.position() == top + 320 && ha(0) == x && hb(0) == r.at_urand64(2) &&
+          hb(1) == r.at_urand64(3));
 
     Kokkos::View<uint64_t *, typename Exec::memory_space> one("one", 1);
     Kokkos::deep_copy(one, ~0ull);
