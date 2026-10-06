@@ -19,6 +19,21 @@ Kokkos::View<float *> g("g", n);
 tandem::fill_normal(g, rng);               // standard normals
 tandem::fill_exponential(g, rng);          // standard exponentials
 
+// Weighted choice: build the alias table on the host, copy it to the device's memory.
+const double w[] = {1, 2, 3, 4};
+Kokkos::View<uint64_t *> cut("cut", 4);
+Kokkos::View<uint32_t *> alias("alias", 4);
+auto hcut = Kokkos::create_mirror_view(cut);
+auto halias = Kokkos::create_mirror_view(alias);
+tandem::ChoiceTable t;
+tandem::choice_build(t, w, 4, hcut.data(), halias.data());
+Kokkos::deep_copy(cut, hcut);
+Kokkos::deep_copy(alias, halias);
+t.cut = cut.data();
+t.alias = alias.data();
+Kokkos::View<uint32_t *> idx("idx", n);
+tandem::fill_choice(idx, rng, t);          // index i with probability w[i] / 10
+
 Kokkos::View<float *> y("y", m);
 Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
     tandem::Rng r = rng.split(i);          // one generator per work item
@@ -58,6 +73,15 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
   `double` View, the sequence of `Rng::exponentialf` or `Rng::exponential` calls. Element `i`
   comes from draw `i` of the Float32 (Float64) fill, so the fill consumes `n` draws. An empty fill
   leaves the position alone.
+- `tandem::choice_build(table, weights, m, cut, alias)` and
+  `tandem::fill_choice(view, rng, table)`: weighted choice of Appendix C. `choice_build` builds
+  the alias table of `m` Float64 weights on the host in exact integers into the caller's `cut`
+  and `alias` arrays of `m` entries, and returns false for no weights, a negative, infinite or
+  NaN weight, or weights that are all zero. `fill_choice` writes indices in `[0, m)` to a
+  `uint32_t` View: element `i` maps draw `i` of the UInt64 fill through the table, so it
+  consumes 64 bits, never retries, and a fill cut at any element equals the whole fill. The
+  table's arrays must be readable by the execution space, so a device fill takes copies in
+  device memory. An empty fill aligns the position to 64. It has an `exec` form like `fill`.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, about 80 bytes. Each
   work item takes its own generator with `rng.split(i)` or by position. There is no state pool.
@@ -77,6 +101,7 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 | `normal2()` | two ziggurat normals from two UInt64 draws, as a pair `z0`, `z1` |
 | `normalf()`, `normalf2()` | the cos half, or both halves, of a Box-Muller step from two Float32 draws |
 | `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
+| `choice(table)` | a weighted choice index from one UInt64 draw |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
 

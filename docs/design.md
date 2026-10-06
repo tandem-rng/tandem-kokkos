@@ -18,6 +18,6 @@ to `KOKKOS_INLINE_FUNCTION` when Kokkos is included first, to `__host__ __device
 nvcc or hipcc, and to `inline` otherwise. It holds `T`, `F`, `F_keyed`, `block`, the stream
 position arithmetic, the float mappings including `to_f16_bits`, `Rng` on the `Draws<D>` base
 that device generators share, `GenState`, the bounded-fill helpers `below_u32` and `below_u64`
-with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, the ziggurat `normal_f64` with its tables in `normal_tables.hpp`, `box_muller2_f32` with the host block `normal_block_f32`, `exponential_f64` and `exponential_f32`, and `Row`, the
+with `PURPOSE_BELOW32` and `PURPOSE_BELOW64`, the ziggurat `normal_f64` with its tables in `normal_tables.hpp`, `box_muller2_f32` with the host block `normal_block_f32`, `exponential_f64` and `exponential_f32`, the weighted choice table build `choice_build` and draw map `choice_of`, and `Row`, the
 eight lanes of a group. HIP and
 SYCL ports can reuse it and add only their fill kernels.
