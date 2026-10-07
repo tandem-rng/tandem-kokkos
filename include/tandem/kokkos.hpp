@@ -208,6 +208,37 @@ struct alignas(16) Block {
     uint32_t w[4];
 };
 
+/* Store the two elements of the 32-bit draws w0, w1 at stream bit P for a kind whose element is
+ * twice the draw, as tandem-cuda's store_tile_widened does: a half slot of 64 stream bits is one
+ * 16-byte store, so consecutive threads write consecutive 16 bytes. Four 8-byte stores per
+ * 16-byte block of draws, 32 bytes apart across threads, ran the uint64_t bounded fill at a
+ * quarter of the plain fill's rate. */
+template <class Kind>
+KOKKOS_FORCEINLINE_FUNCTION void store_half_widened(typename elem<Kind>::out_t *out, const Span &s,
+                                                    uint64_t P, uint32_t w0, uint32_t w1) {
+    using O = typename elem<Kind>::out_t;
+    static_assert(elem<Kind>::bits == 32 && sizeof(O) == 8, "a half slot holds two 32-bit draws");
+    const uint32_t w[4] = {w0, w1, 0u, 0u};
+    if (P >= s.p0 && P + 64u <= s.p1) {
+        uint64_t e0 = (P - s.p0) / 32u;
+        O *dst = out + e0;
+        if ((reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
+            struct alignas(16) Vec {
+                O v[2];
+            } x{{elem<Kind>::make(w, 0, e0, s), elem<Kind>::make(w, 1, e0 + 1, s)}};
+            *reinterpret_cast<Vec *>(dst) = x;
+            return;
+        }
+    }
+    for (unsigned k = 0; k < 2; k++) {
+        uint64_t q = P + k * 32u;
+        if (q >= s.p0 && q < s.p1) {
+            uint64_t e = (q - s.p0) / 32u;
+            out[e] = elem<Kind>::make(w, k, e, s);
+        }
+    }
+}
+
 /* Auto is Group on host spaces, else Tile. Tile needs K >= 8 and falls back to Chunk. */
 enum class Kernel {
     Auto,
@@ -328,6 +359,35 @@ void fill_chunk(const Exec &exec, const Span s, typename elem<Kind>::out_t *out)
 
 constexpr unsigned TILE_THREADS = 256, TILE_GROUPS = TILE_THREADS / 8, TILE_STEPS = 8;
 
+/* The write phase of the tile kernel for team rank `rank`: consecutive ranks take consecutive
+ * 16-byte output slots, whole blocks, or half blocks for elements twice the draw. A function of
+ * its own, since nvcc's device lambdas cannot first capture a variable under if constexpr. */
+template <class Kind, bool ALIGNED>
+KOKKOS_FORCEINLINE_FUNCTION void write_tile(const Block *tile, typename elem<Kind>::out_t *out,
+                                            const Span &s, uint64_t gb, uint32_t jb,
+                                            unsigned rank) {
+    constexpr unsigned SLOTS = TILE_GROUPS * TILE_STEPS * 8;
+    if constexpr (sizeof(typename elem<Kind>::out_t) * 8 == 2 * elem<Kind>::bits) {
+        for (unsigned half = rank; half < 2 * SLOTS; half += TILE_THREADS) {
+            unsigned slot = half >> 1, sg = slot / (TILE_STEPS * 8),
+                     within = half % (2 * TILE_STEPS * 8);
+            uint64_t P = ((gb + sg) * s.K + jb) * 1024u + within * 64u;
+            if (P >= s.p1)
+                continue;
+            const uint32_t *w = tile[slot].w + 2 * (half & 1u);
+            store_half_widened<Kind>(out, s, P, w[0], w[1]);
+        }
+    } else {
+        for (unsigned slot = rank; slot < SLOTS; slot += TILE_THREADS) {
+            unsigned sg = slot / (TILE_STEPS * 8), within = slot % (TILE_STEPS * 8);
+            uint64_t P = ((gb + sg) * s.K + jb) * 1024u + within * 128u;
+            if (P >= s.p1)
+                continue;
+            store_block<Kind, ALIGNED>(out, s, P, tile[slot].w);
+        }
+    }
+}
+
 /* One thread per chunk, 32 groups per team. Every TILE_STEPS steps the team holds, for each of
  * its groups, TILE_STEPS consecutive rows, 1024 contiguous bytes of the stream. The write phase
  * hands consecutive 16-byte slots to consecutive threads, so a warp writes 512 contiguous
@@ -360,13 +420,7 @@ void fill_tile(const Exec &exec, const Span s, typename elem<Kind>::out_t *out) 
                     }
                 }
                 team.team_barrier();
-                for (unsigned slot = rank; slot < SLOTS; slot += TILE_THREADS) {
-                    unsigned sg = slot / (TILE_STEPS * 8), within = slot % (TILE_STEPS * 8);
-                    uint64_t P = ((gb + sg) * s.K + jb) * 1024u + within * 128u;
-                    if (P >= s.p1)
-                        continue;
-                    store_block<Kind, ALIGNED>(out, s, P, tile[slot].w);
-                }
+                write_tile<Kind, ALIGNED>(tile, out, s, gb, jb, rank);
                 team.team_barrier();
             }
         });
