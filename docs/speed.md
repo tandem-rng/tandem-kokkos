@@ -64,7 +64,8 @@ The other fills on the same GPU:
 | `fill_exponential`, `double` | 2^26 | 938 | 782 | `curandGenerateUniformDouble`, nearest |
 | `fill_exponential`, `double` | 2^28 | 928 | 788 | `curandGenerateUniformDouble`, nearest |
 
-`fill_below` uses range 1000.
+`fill_below` uses range 1000. The `float` exponential rows predate tandem-cuda e98daee, whose
+two-float logarithm adds 10 f32 operations per draw, and have not been measured since.
 
 The bounded fill adds a multiply and a compare per element and stays within 2% of the plain
 fill of the same width. Its rejection threshold is computed once per fill: with a division per
