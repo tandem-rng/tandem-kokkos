@@ -7,6 +7,7 @@
 #pragma once
 
 #include <Kokkos_Core.hpp>
+#include <Kokkos_Random.hpp>
 
 #include <cstdint>
 #include <cstring>
@@ -26,6 +27,7 @@ namespace detail {
 
 struct f16_bits {}; /* binary16 bit patterns of the Float16 draws, stored as uint16_t */
 struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW32 */
+struct below32w {}; /* the same into uint64_t, for ranges up to 2^32 */
 struct below64 {};
 struct exp32 {}; /* exponentials over the f32 fill, see exponential_f32 */
 struct exp64 {};
@@ -153,6 +155,14 @@ template <> struct elem<below32> {
                                                 const Span &s) {
         return below_u32_t(w[k], (uint32_t)s.range, (uint32_t)s.thresh, s.key.w, s.K,
                            (s.p0 >> 5) + e);
+    }
+};
+template <> struct elem<below32w> {
+    using out_t = uint64_t;
+    static constexpr unsigned bits = 32;
+    KOKKOS_INLINE_FUNCTION static uint64_t make(const uint32_t w[4], unsigned k, uint64_t e,
+                                                const Span &s) {
+        return below_u32_wide(w[k], s.range, (uint32_t)s.thresh, s.key.w, s.K, (s.p0 >> 5) + e);
     }
 };
 template <> struct elem<below64> {
@@ -385,13 +395,10 @@ void fill_with(const Exec &exec, const Span &s, typename elem<Kind>::out_t *out,
 /* Set the span of a fill that takes `n` elements of `bits` bits from the generator's position
  * aligned to `align` bits, and move the position past them. Returns false for an empty fill. */
 inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span &s) {
-    uint64_t p0 = align_pos(rng.position(), align);
-    if (p0 < rng.position() || n > (~(uint64_t)0 - p0) / bits)
-        throw std::overflow_error("tandem::fill: the fill runs past stream position 2^64");
+    s.p1 = fill_end(rng.position(), align, bits, n); /* throws std::length_error at 2^64 */
+    s.p0 = align_pos(rng.position(), align);
     s.K = rng.chunk_length();
     s.key = rng.key();
-    s.p0 = p0;
-    s.p1 = p0 + n * bits;
     s.range = s.thresh = 0;
     s.table = ChoiceTable{};
     rng.advance_to(s.p1); /* the end may lie at or past 2^63, which set_position rejects */
@@ -819,11 +826,12 @@ template <class View> void fill_f16_bits(const View &view, Rng &rng) {
     exec.fence("tandem::fill_f16_bits: fence after the fill");
 }
 
-/* Uniform integers on [0, range) in a uint32_t or uint64_t View, by Lemire's method as
- * Rng::urand(range). Element i takes draw i of the u32 (u64) fill and consumes exactly that one
- * draw, so the fill advances the position by 32 n (64 n) bits whatever the draws are. A rejected
- * draw retries on a fallback stream, see PURPOSE_BELOW32 in core.hpp. Not part of the
- * specification. */
+/* Uniform integers on [0, range) in a uint32_t or uint64_t View, by Lemire's method. The View
+ * names only the result type, so the draw width comes from the range (spec Appendix A): element i
+ * takes draw i of the u32 fill for range <= 2^32, as Rng::urand(range), else of the u64 fill, as
+ * Rng::urand64(range), and consumes exactly that one draw, so the fill advances the position by
+ * 32 n or 64 n bits whatever the draws are. A rejected draw retries on a fallback stream, see
+ * PURPOSE_BELOW32 in core.hpp. Not part of the specification. */
 template <class Exec, class View>
 void fill_below(const Exec &exec, const View &view, Rng &rng,
                 typename View::non_const_value_type range) {
@@ -834,10 +842,18 @@ void fill_below(const Exec &exec, const View &view, Rng &rng,
     detail::check_view<Exec>(view, "tandem::fill_below");
     if (view.size() == 0) /* no draws, so no alignment either */
         return;
-    using Kind = std::conditional_t<sizeof(E) == 4, detail::below32, detail::below64>;
-    detail::fill_kind<Exec, Kind>(exec, reinterpret_cast<typename detail::elem<Kind>::out_t *>(
-                                            view.data()),
-                                  view.size(), rng, detail::Kernel::Auto, range);
+    auto run = [&](auto kind) {
+        using Kind = decltype(kind);
+        detail::fill_kind<Exec, Kind>(
+            exec, reinterpret_cast<typename detail::elem<Kind>::out_t *>(view.data()), view.size(),
+            rng, detail::Kernel::Auto, range);
+    };
+    if constexpr (sizeof(E) == 4)
+        run(detail::below32{});
+    else if (below_width(range) == 32)
+        run(detail::below32w{});
+    else
+        run(detail::below64{});
 }
 template <class View>
 void fill_below(const View &view, Rng &rng, typename View::non_const_value_type range) {
@@ -916,3 +932,39 @@ template <class View> void fill_exponential(const View &view, Rng &rng) {
 }
 
 } // namespace tandem
+
+/* Kokkos::rand<Rng, T> calls Rng's draws by the method names of the Kokkos generators. Its draws
+ * with a range or bounds name only the result type, so for the 64-bit integer types they take the
+ * draw width from the range (spec Appendix A): 32 bits for range <= 2^32, else 64. Kokkos's own
+ * specializations would draw 64 bits whatever the range. */
+namespace tandem::detail {
+template <class T> struct rand_by_range {
+    using U = std::make_unsigned_t<T>;
+    KOKKOS_INLINE_FUNCTION static T max() {
+        if constexpr (sizeof(T) == 4)
+            return std::is_signed_v<T> ? (T)Rng::MAX_RAND : (T)Rng::MAX_URAND;
+        else
+            return std::is_signed_v<T> ? (T)Rng::MAX_RAND64 : (T)Rng::MAX_URAND64;
+    }
+    KOKKOS_INLINE_FUNCTION static T draw(Rng &gen) {
+        if constexpr (sizeof(T) == 4)
+            return std::is_signed_v<T> ? (T)gen.rand() : (T)gen.urand();
+        else
+            return std::is_signed_v<T> ? (T)gen.rand64() : (T)gen.urand64();
+    }
+    KOKKOS_INLINE_FUNCTION static T draw(Rng &gen, const T &range) {
+        return (T)gen.below((uint64_t)(U)range);
+    }
+    KOKKOS_INLINE_FUNCTION static T draw(Rng &gen, const T &start, const T &end) {
+        return (T)(U)((U)start + (U)gen.below((uint64_t)(U)((U)end - (U)start)));
+    }
+};
+} // namespace tandem::detail
+
+namespace Kokkos {
+template <> struct rand<tandem::Rng, long> : tandem::detail::rand_by_range<long> {};
+template <> struct rand<tandem::Rng, unsigned long> : tandem::detail::rand_by_range<unsigned long> {};
+template <> struct rand<tandem::Rng, long long> : tandem::detail::rand_by_range<long long> {};
+template <> struct rand<tandem::Rng, unsigned long long>
+    : tandem::detail::rand_by_range<unsigned long long> {};
+} // namespace Kokkos

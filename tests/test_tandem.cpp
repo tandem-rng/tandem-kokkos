@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 #include <limits>
 #include <random>
@@ -479,7 +480,7 @@ template <class Exec> static void test_bounded() {
     CHECK(KR::draw(a) == b.drand());
     CHECK(KF::draw(a, 2.0f) == b.frand(2.0f));
     CHECK(KU::draw(a, 10u) == b.urand(10u));
-    CHECK(KI::draw(a, -4, 9) == b.rand64(-4, 9));
+    CHECK(KI::draw(a, -4, 9) == -4 + (int64_t)b.urand(13u)); // width from the range
     CHECK(KU64::draw(a) == b.urand64());
 }
 
@@ -1050,10 +1051,12 @@ static std::vector<uint64_t> fill_case(const Case &c, Rng &r, uint64_t n, Kernel
     auto below = [&](auto out) {
         using E = typename decltype(out)::non_const_value_type;
         using Kind = std::conditional_t<sizeof(E) == 4, td::below32, td::below64>;
-        if (pub)
+        // A uint64_t View takes 64-bit draws from fill_below only above range 2^32, so the u64
+        // cases of smaller ranges run their width-naming kind on the public path.
+        if (pub && (sizeof(E) == 4 || n == 0 || tandem::below_width(c.range) == 64))
             tandem::fill_below(exec, out, r, (E)c.range);
         else
-            td::fill_kind<Exec, Kind>(exec, out.data(), n, r, kernel, c.range);
+            td::fill_kind<Exec, Kind>(exec, out.data(), n, r, pub ? Kernel::Auto : kernel, c.range);
     };
     auto normal = [&](auto out) {
         if (pub)
@@ -1128,7 +1131,7 @@ static void check_shift(const std::vector<Case> &cases, const char *a, const cha
     CHECK(ok);
 }
 
-enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32, choice };
+enum class Scalar { below_u32, below_u64, below_rand64, normal_f64, normal_f32, exp_f64, exp_f32, choice };
 
 KOKKOS_INLINE_FUNCTION uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range,
                                             const tandem::ChoiceTable &t) {
@@ -1139,6 +1142,8 @@ KOKKOS_INLINE_FUNCTION uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range,
         return r.urand((uint32_t)range);
     case Scalar::below_u64:
         return r.urand64(range);
+    case Scalar::below_rand64:
+        return Kokkos::rand<Rng, uint64_t>::draw(r, range);
     case Scalar::normal_f64:
         return bit_pattern(r.normal());
     case Scalar::normal_f32:
@@ -1193,11 +1198,11 @@ template <class Exec> static void check_range0_and_empty() {
     tandem::fill_below(u32, r, 0u);
     CHECK(Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), u32)(0) == 0 &&
           r.position() == 96);
-    tandem::fill_below(u64, r, (uint64_t)0);
+    tandem::fill_below(u64, r, (uint64_t)0); // range 0 <= 2^32 takes a 32-bit draw
     CHECK(Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), u64)(0) == 0 &&
-          r.position() == 192);
-    CHECK(r.urand(0u) == 0 && r.position() == 224);
-    CHECK(r.urand64((uint64_t)0) == 0 && r.position() == 320);
+          r.position() == 128);
+    CHECK(r.urand(0u) == 0 && r.position() == 160);
+    CHECK(r.urand64((uint64_t)0) == 0 && r.position() == 256);
 
     for (uint64_t pos : {33ull, 65ull}) {
         Rng g = Rng::from_key(Rng(42).key(), pos, 32);
@@ -1210,6 +1215,45 @@ template <class Exec> static void check_range0_and_empty() {
         tandem::fill(none1, g);
         CHECK(g.position() == pos);
     }
+}
+
+// Width from range: fill_below on a uint64_t View and Kokkos::rand<Rng, uint64_t>::draw name only
+// the result type, so they draw 32 bits for range <= 2^32. Every u32 case of fill_below.json
+// through a uint64_t View gives the case's values and end, so 64 elements at range 1000 from the
+// key of seed 42 at position 0 are CROSS_BELOW32[3], not CROSS_BELOW64[3]. Range 2^32 returns the
+// draw, and 2^32 + 1 takes 64-bit draws.
+template <class Exec> static void check_width_from_range(const std::vector<Case> &fill_below) {
+    const Exec exec;
+    for (const Case &c : fill_below) {
+        if (c.kind != "fill_below_u32")
+            continue;
+        Rng r = Rng::from_key(c.key, c.start, c.K);
+        auto got = case_values<Exec, uint64_t>(
+            c.n, [&](auto out) { tandem::fill_below(exec, out, r, (uint64_t)c.range); });
+        CHECK(matches<Exec>(c, got) && r.position() == c.end);
+    }
+    const Case &b32 = case_named(fill_below, "CROSS_BELOW32[3]");
+    CHECK(b32.range == 1000 && b32.start == 0 && b32.values != case_named(fill_below, "CROSS_BELOW64[3]").values);
+    check_scalars<Exec>(b32, Scalar::below_rand64, b32.n, 64 * 32);
+    const uint64_t r32 = 1ull << 32;
+    for (uint64_t range : {r32, r32 + 1}) {
+        Rng r = Rng::from_key(b32.key, 0, 32), w = r;
+        auto got = case_values<Exec, uint64_t>(
+            64, [&](auto out) { tandem::fill_below(exec, out, r, range); });
+        std::vector<uint64_t> want(64);
+        for (uint64_t &v : want)
+            v = range == r32 ? w.urand() : w.urand64(range);
+        CHECK(got == want && r.position() == w.position());
+    }
+    // Signed and bounds draws of the 64-bit types take the same width.
+    Rng a = Rng::from_key(b32.key, 0, 32), b = a;
+    using KI = Kokkos::rand<Rng, int64_t>;
+    using KL = Kokkos::rand<Rng, long long>;
+    using KU = Kokkos::rand<Rng, unsigned long long>;
+    CHECK(KI::draw(a, -4, 9) == -4 + (int64_t)b.urand(13u));
+    CHECK(KL::draw(a, 1000) == (long long)b.urand(1000u));
+    CHECK(KU::draw(a, r32 + 1) == b.urand64(r32 + 1));
+    CHECK(a.position() == b.position());
 }
 
 template <class Exec> static void test_cases(const std::string &dir) {
@@ -1246,6 +1290,7 @@ template <class Exec> static void test_cases(const std::string &dir) {
     check_shift<Exec>(normal, "CROSS_NORMAL32[2]", "CROSS_NORMAL32[0]", 2);
     check_shift<Exec>(normal, "CROSS_NORMAL32[1]", "CROSS_NORMALF", 0);
     check_range0_and_empty<Exec>();
+    check_width_from_range<Exec>(fill_below);
 }
 
 // ---- Weighted choice ------------------------------------------------------------------------
@@ -1448,20 +1493,38 @@ template <class Exec> static void check_position_bounds() {
     CHECK(f.position() == top + 320 && ha(0) == x && hb(0) == r.at_urand64(2) &&
           hb(1) == r.at_urand64(3));
 
+    // Fills whose end align(p, w) + w n reaches 2^64 throw std::length_error before they launch:
+    // Views of 2^57 doubles or 2^58 floats over one element of memory end exactly at 2^64 from
+    // 2^63 - 1, which aligns to 2^63. The memory and the position stay as they were.
     Kokkos::View<uint64_t *, typename Exec::memory_space> one("one", 1);
-    Kokkos::deep_copy(one, ~0ull);
-    Kokkos::View<uint64_t *, typename Exec::memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>
-        huge(one.data(), (size_t)1 << 57);
-    Rng g = Rng::from_key(key, top - 1, 32);
-    bool threw = false;
-    try {
-        tandem::fill(Exec(), huge, g);
-    } catch (const std::overflow_error &) {
-        threw = true;
+    using Huge64 = Kokkos::View<uint64_t *, typename Exec::memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using HugeF = Kokkos::View<float *, typename Exec::memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    using HugeD = Kokkos::View<double *, typename Exec::memory_space, Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    const Huge64 huge(one.data(), (size_t)1 << 57);
+    const HugeF hugef(reinterpret_cast<float *>(one.data()), (size_t)1 << 58);
+    const HugeD huged(reinterpret_cast<double *>(one.data()), (size_t)1 << 57);
+    const Exec exec;
+    const std::function<void(Rng &)> fills[] = {
+        [&](Rng &g) { tandem::fill(exec, huge, g); },
+        [&](Rng &g) { tandem::fill(exec, hugef, g); },
+        [&](Rng &g) { tandem::fill_below(exec, huge, g, (1ull << 32) + 1); },
+        [&](Rng &g) { tandem::fill_normal(exec, huged, g); },
+        [&](Rng &g) { tandem::fill_normal(exec, hugef, g); },
+        [&](Rng &g) { tandem::fill_exponential(exec, hugef, g); },
+    };
+    for (const auto &fill : fills) {
+        Kokkos::deep_copy(one, ~0ull);
+        Rng g = Rng::from_key(key, top - 1, 32);
+        bool threw = false;
+        try {
+            fill(g);
+        } catch (const std::length_error &) {
+            threw = true;
+        }
+        Exec().fence();
+        CHECK(threw && g.position() == top - 1 &&
+              Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), one)(0) == ~0ull);
     }
-    Exec().fence();
-    CHECK(threw && g.position() == top - 1 &&
-          Kokkos::create_mirror_view_and_copy(Kokkos::HostSpace(), one)(0) == ~0ull);
 }
 
 // ---- Backends -----------------------------------------------------------------------------
