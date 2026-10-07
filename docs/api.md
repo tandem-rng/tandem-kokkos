@@ -53,9 +53,11 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 - `tandem::fill_f16_bits(view, rng)`: the binary16 bit patterns of the Float16 draws in a
   `uint16_t` View. A `uint16_t` View in `fill` gets raw 16-bit draws.
 - `tandem::fill_below(view, rng, range)`: uniform integers on `[0, range)` in a `uint32_t` or
-  `uint64_t` View, by Lemire's method as `Rng::urand(range)`. Element `i` takes draw `i` of the
-  u32 (u64) fill and consumes exactly that draw, so the fill advances the position by 32 n
-  (64 n) bits whatever the draws are. A rejected draw retries on a fallback stream, `split(g)`
+  `uint64_t` View, by Lemire's method. The View names only the result type, so the draw width
+  comes from the range, as Appendix A requires: element `i` takes draw `i` of the u32 fill for
+  `range <= 2^32`, as `Rng::urand(range)`, else of the u64 fill, as `Rng::urand64(range)`, and
+  consumes exactly that draw, so the fill advances the position by 32 n or 64 n bits whatever
+  the draws are. A rejected draw retries on a fallback stream, `split(g)`
   of `sub(PURPOSE_BELOW32)` (or `64`), keyed by the global draw index `g`, the aligned start
   position over the width plus `i`. A fill without rejections equals the sequential
   `urand(range)` calls, a fill cut at any element equals the whole fill, and the rare rejection
@@ -97,6 +99,7 @@ Kokkos::parallel_for(m, KOKKOS_LAMBDA(int i) {
 | `bit()`, `urand()`, `urand64()`, `frand()`, `drand()` | the specification's Bool, UInt32, UInt64, Float32 and Float64 draws |
 | `at_urand(i)`, `at_urand64(i)`, `at_frand(i)`, `at_drand(i)` | element `i` of the fill that would start here, without advancing |
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
+| `below(range)` | a bounded draw whose width comes from the range: 32 bits for `range <= 2^32`, else 64 |
 | `normal()`, `normal(mean, sd)` | a ziggurat normal from one UInt64 draw |
 | `normal2()` | two ziggurat normals from two UInt64 draws, as a pair `z0`, `z1` |
 | `normalf()`, `normalf2()` | the cos half, or both halves, of a Box-Muller step from two Float32 draws |
@@ -109,14 +112,17 @@ Signed integers hold the two's complement of the unsigned draw of the same width
 value takes two draws, the real and then the imaginary component. `half_t` needs a Kokkos with a
 half type, which the conda-forge build for macOS lacks: there `half_t` is `float` and `fill`
 writes Float32 draws. A View that is not contiguous, such as a column of a `LayoutRight` matrix,
-throws `std::invalid_argument`.
+throws `std::invalid_argument`. A fill whose end `align(p, w) + w n` reaches 2^64 throws
+`std::length_error` before it launches, and leaves the View and the generator unchanged.
 
 Bounded, normal and exponential draws follow the specification's non-normative Appendix A and
 the same fills in tandem-cuda. `core.hpp` computes `log`, `sin` and `cos` with polynomials whose
 multiply-adds are explicit fused ones, so every backend writes tandem-c's bits for bounded
 integers, double normals and exponentials, and host backends do for float normals. CUDA float
 normals take the fast `__sincosf` and agree to 16 ulps + 1e-6. Build with `-ffp-contract=off`, and with `-mfma` on x86 so the fused operations stay inline. The method names and the `MAX_*` constants follow the Kokkos generators, so
-`Kokkos::rand<tandem::Rng, T>::draw(rng, ...)` works.
+`Kokkos::rand<tandem::Rng, T>::draw(rng, ...)` works. Its draws with a range or bounds name only
+the result type, so `tandem/kokkos.hpp` specializes it for the 64-bit integer types to take the
+width from the range through `Rng::below(range)`: 32 bits for `range <= 2^32`, else 64.
 
 ### No `Kokkos::fill_random` pool
 

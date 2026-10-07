@@ -36,7 +36,7 @@ has its test, run on every backend:
 | checklist section | test |
 |---|---|
 | Fallback by global draw index | `check_fill_cases` on `fill_below.json` and `normal.json`, `check_shift` on the `_AT[4]`, `_AT[6]` and `CROSS_NORMAL[1]` pairs |
-| Width from range | `fill_below` names the width by its element type, checked by the `fill_below.json` cases; `check_range0_and_empty` |
+| Width from range | `check_width_from_range`: every u32 case of `fill_below.json` through `fill_below` on a `uint64_t` View, `Kokkos::rand<Rng, uint64_t>::draw` on `CROSS_BELOW32[3]`, ranges 2^32 and 2^32 + 1, the signed and bounds draws; the u64 cases through their width-naming kind; `check_range0_and_empty` |
 | n = 0 | the seven `n = 0` cases through the public fills, onto a sentinel; `check_range0_and_empty` for uniform fills |
 | Odd n | the `CROSS_NORMAL32` cases, values and end |
 | Pair rule for Float32 Box-Muller | `CROSS_NORMALF`, `check_shift` on `CROSS_NORMAL32[1]` and `[2]`, `check_scalars` for `normalf()` |
@@ -51,11 +51,11 @@ except CUDA Float32 normals, which take the case's tolerance. A Float32 normal f
 odd element drops that piece's last sin half, so it cuts only between pairs. The Float32 normal
 dump hash holds for C's polynomials, which host fills take and CUDA's `__sincosf` does not, so
 that dump runs on host backends. `hashes.json` has no fill here for its UInt128 and Char
-streams. `Kokkos::rand<tandem::Rng, uint64_t>::draw(rng, range)` calls `urand64(range)`, which
-names the width. `check_position_bounds` checks the start bounds on the host and in kernels, and
-that a fill ending past 2^63 moves the generator there, so the next fill continues the stream.
-The fill that reaches 2^64 has a View of 2^57 elements over one element of memory, since the
-fill throws before it writes.
+streams. `check_position_bounds` checks the start bounds on the host and in kernels, and that a
+fill ending past 2^63 moves the generator there, so the next fill continues the stream. It runs
+uniform, bounded, normal and exponential fills whose end reaches exactly 2^64 on Views of 2^57
+or 2^58 elements over one element of memory: each throws `std::length_error` before it writes,
+and the memory and the position stay unchanged.
 
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`.
