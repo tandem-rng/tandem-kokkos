@@ -28,9 +28,9 @@ to 3 in both layouts. Every non-Serial backend must then write the bytes Serial 
 
 ## Conformance files
 
-`tests/conformance/*.json` are byte-identical copies of tandem-spec f420545
+`tests/conformance/*.json` are byte-identical copies of tandem-spec 2a4bd08
 `conformance/*.json`, read by `tests/conformance.hpp`. The tests follow
-`conformance/CHECKLIST.md` at tandem-spec b31af72, whose JSON files equal f420545's. Each item
+`conformance/CHECKLIST.md` at the same commit. Each item
 has its test, run on every backend:
 
 | checklist section | test |
@@ -66,4 +66,4 @@ and the memory and the position stay unchanged.
   Each builds with `-Wall -Wextra -Werror` and the benchmark, then runs `ctest` with four OpenMP
   threads.
 - One job checks that the vector header is current and that the conformance copies equal
-  tandem-spec f420545, and one that the tandem-cuda pin is on its main branch.
+  tandem-spec 2a4bd08, and one that the tandem-cuda pin is on its main branch.
