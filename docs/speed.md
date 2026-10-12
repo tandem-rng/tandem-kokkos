@@ -1,4 +1,4 @@
-# Speed
+# Performance
 
 `tools/bench.cpp` (`-DTANDEM_BENCH=ON`): half-second warm-up, minimum of 15 runs, GiB/s written.
 

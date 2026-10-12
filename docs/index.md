@@ -7,7 +7,7 @@ Kokkos backend. Two headers, C++20, no compiled library.
 - [API](api.md): `tandem::fill` and the other fills, `tandem::Rng` draws and parallel use.
 - [Design](design.md): the kernels and the portable core.
 - [Tests](tests.md): what the suite checks, where the fixtures come from, and what CI runs.
-- [Speed](speed.md): M4 Pro and A100 figures against `Kokkos::fill_random`.
+- [Performance](speed.md): M4 Pro and A100 figures against `Kokkos::fill_random`.
 
 ## Install
 
