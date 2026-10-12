@@ -10,7 +10,7 @@
 a noncryptographic random number generator. It writes the specification's stream bit for bit
 on every Kokkos backend, fast on CPUs and GPUs. Two headers, C++20, no compiled library.
 
-Needs C++20 and Kokkos 5. The submodule `external/tandem-cuda` is pinned at fd8f2ff.
+## Install
 
 ```sh
 git clone --recurse-submodules https://github.com/tandem-rng/tandem-kokkos
@@ -20,6 +20,8 @@ git clone --recurse-submodules https://github.com/tandem-rng/tandem-kokkos
 add_subdirectory(tandem-kokkos)        # or find_package(tandem-kokkos) after cmake --install
 target_link_libraries(app PRIVATE tandem::kokkos)
 ```
+
+## Quick start
 
 ```cpp
 #include <tandem/kokkos.hpp>
@@ -31,9 +33,15 @@ tandem::Rng w = rng.split(7);              // child stream from the key alone
 tandem::fill_exponential(x, w);            // standard exponentials, -log(1 - u)
 ```
 
+## Requirements
+
+Needs C++20 and Kokkos 5. The submodule `external/tandem-cuda` is pinned at fd8f2ff.
+
+## Documentation
+
 See [API](docs/api.md) for every fill and `Rng` draw, and [design](docs/design.md),
 [tests](docs/tests.md) and [speed](docs/speed.md) for the rest.
 
 Portions of the code were generated with the assistance of LLMs.
 
-[Documentation](https://tandem-rng.github.io/tandem-kokkos/) · [Apache 2.0 license](LICENSE)
+[Docs](https://tandem-rng.github.io/tandem-kokkos/) · [Specification](https://github.com/tandem-rng/spec/blob/main/SPEC.md) · [Website](https://tandem-rng.github.io/) · [Issues](https://github.com/tandem-rng/tandem-kokkos/issues) · [License](LICENSE)
